@@ -494,16 +494,20 @@ def complete_ticket(code):
     return True
 
 
-def mark_no_show(code):
-    """Customer was called but never came. Frees the counter. NOT used to train the wait model."""
+def mark_no_show(code, by="admin"):
+    """Customer was called but never came. Frees the counter. NOT used to train the wait model.
+    The ticket is also flagged as deleted (by whoever pressed No-show), so it shows up flagged in the
+    manager's database. The row is kept; the manager can untick the flag to restore it."""
     outbox = []
     with connect() as conn:
         row = conn.execute("SELECT * FROM tickets WHERE ticket_code=? AND status='Serving'",
                            ((code or "").upper().strip(),)).fetchone()
         if not row:
             return False
-        conn.execute("UPDATE tickets SET status='No-show', completed_at=?, updated_at=? WHERE id=?",
-                     (_now(), _now(), row["id"]))
+        now = _now()
+        conn.execute("UPDATE tickets SET status='No-show', completed_at=?, updated_at=?, "
+                     "is_deleted=1, deleted_at=?, deleted_by=? WHERE id=?",
+                     (now, now, now, by, row["id"]))
         _record(conn, outbox, row["ticket_code"], row["phone"],
                 f"{row['ticket_code']} was called but not answered, so it was closed. Please take a new ticket.")
         _promote_next(conn, outbox, row["service"])
@@ -586,7 +590,7 @@ def get_stats():
         return {"total": n("is_deleted=0"), "waiting": n("is_deleted=0 AND status='Waiting'"),
                 "serving": n("is_deleted=0 AND status='Serving'"),
                 "completed": n("is_deleted=0 AND status='Completed'"),
-                "no_show": n("is_deleted=0 AND status='No-show'"), "deleted": n("is_deleted=1")}
+                "no_show": n("status='No-show'"), "deleted": n("is_deleted=1")}
 
 
 def completed_durations():

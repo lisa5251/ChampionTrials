@@ -4,6 +4,7 @@ import inspect
 import io
 import os
 import re
+import socket
 import time
 
 import streamlit as st
@@ -259,8 +260,30 @@ def service_wait_now(service):
     return len(waiting), predict_wait_range(wait_model, service, load, counters)[1]
 
 
+def lan_ip():
+    """This PC's address on the local network (e.g. 192.168.1.20), or None if it can't be found."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))   # no data is sent; this only picks the right network card
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+LOCAL_ONLY = re.compile(r"//(localhost|127\.0\.0\.1)(?=[:/]|$)", re.I)
+
+
 def join_url():
-    return db.get_settings()["public_url"].rstrip("/") + "/?join=1"
+    """Address in the QR code. A phone can't open 'localhost' (that is the phone itself), so if the saved
+    address is localhost we swap in this PC's Wi-Fi address automatically."""
+    base = db.get_settings()["public_url"].rstrip("/")
+    if LOCAL_ONLY.search(base):
+        ip = lan_ip()
+        if ip:
+            base = LOCAL_ONLY.sub("//" + ip, base, count=1)
+    return base + "/?join=1"
 
 
 @st.cache_data(show_spinner=False)
@@ -373,7 +396,7 @@ def ticket_details(code):
 
         return None
 
-    if ticket["is_deleted"]:
+    if ticket["is_deleted"] and ticket["status"] != "No-show":
 
         st.warning("This ticket was removed by staff. Please ask at the service desk.")
 
@@ -700,7 +723,8 @@ def desk_waiting_table(service):
 
 PAGES = ["Queue Display", "Customer Portal", "Admin Panel", "Manager Database"]
 PUBLIC_PAGES = ["Queue Display", "Customer Portal"]            # no login, for everyone
-ROLE_PAGES = {"admin": ["Admin Panel"], "manager": ["Admin Panel", "Manager Database"]}
+# each role gets its own page and nothing else: admin runs the counters, manager owns the database
+ROLE_PAGES = {"admin": ["Admin Panel"], "manager": ["Manager Database"]}
 
 # drop the session of an account that was disabled or removed meanwhile
 STAFF_IDLE_SECONDS = 60 * 60   # staff are signed out after an hour without clicking anything
@@ -768,7 +792,7 @@ def staff_access(where):
             elif role:
                 st.session_state["user"] = {"username": login_user.strip().lower(), "role": role}
                 st.session_state["staff_seen"] = time.time()
-                st.session_state["_goto"] = "Admin Panel"
+                st.session_state["_goto"] = ROLE_PAGES[role][0]
                 st.rerun()
 
             else:
@@ -1178,7 +1202,7 @@ elif page == "Customer Portal":
 
 elif page == "Admin Panel":
 
-    if not require_role("admin", "manager"):
+    if not require_role("admin"):
         st.stop()
 
     hero("ADMIN", "See everything. Keep service moving.",
@@ -1229,7 +1253,7 @@ elif page == "Admin Panel":
                     st.toast(f"{t['ticket_code']} re-announced.")
 
             if b3.button("🚫 No-show", **STRETCH_BTN):
-                if db.mark_no_show(t["ticket_code"]):
+                if db.mark_no_show(t["ticket_code"], st.session_state["user"]["username"]):
                     st.rerun()
 
             x1, x2 = st.columns([2, 1])
@@ -1267,8 +1291,11 @@ elif page == "Admin Panel":
         st.write("")
         period = st.selectbox("Period for the figures below", ["Today", "Last 7 days", "All time"], key="an_period")
 
-        rows = db.list_tickets(limit=5000)
+        # no-shows are flagged as deleted for the manager, but they still count in the analytics
+        rows = db.list_tickets(include_deleted=True, limit=5000)
         df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+        if not df.empty:
+            df = df[(df["is_deleted"] == 0) | (df["status"] == "No-show")]
 
         if not df.empty:
             df["created"] = pd.to_datetime(df["created_at"], errors="coerce")
@@ -1391,6 +1418,12 @@ elif page == "Admin Panel":
         if png:
             st.download_button("⬇ Download QR (PNG)", png, "waitwise_join_qr.png", "image/png")
         st.code(join_url())
+        if LOCAL_ONLY.search(join_url()):
+            st.warning("This address only works on this computer. Phones can't open it. Connect the PC to Wi-Fi and "
+                       "set the public address above to your PC's address, e.g. http://192.168.1.20:8501.")
+        st.caption("For phones to connect: start the app with "
+                   "`python -m streamlit run app.py --server.address 0.0.0.0`, keep the phone on the same Wi-Fi, "
+                   "and click Allow if Windows Firewall asks about Python.")
 
         st.markdown("**Notifications**")
         if notifier.sms_enabled():
