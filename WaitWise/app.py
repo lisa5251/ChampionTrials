@@ -1,15 +1,20 @@
+import hmac
 import html
 import inspect
+import io
 import os
+import time
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 import database as db
+import notifier
 from ai_engine import (
     SERVICES,
     train_wait_model,
-    predict_wait,
+    predict_wait_range,
+    wait_model_mae,
     build_chatbot,
     chatbot_reply
 )
@@ -64,16 +69,17 @@ STRETCH_ED = _stretch(st.data_editor)
 # LOAD AI MODELS
 # =====================================================
 
-@st.cache_resource
+@st.cache_resource(ttl=300)
 def load_ai():
     durations = db.completed_durations()
     wait_model, using_real_history = train_wait_model(durations)
     chatbot = build_chatbot()
+    mae = wait_model_mae(durations)
 
-    return wait_model, using_real_history, chatbot
+    return wait_model, using_real_history, chatbot, mae
 
 
-wait_model, using_real_history, chatbot = load_ai()
+wait_model, using_real_history, chatbot, model_mae = load_ai()
 
 
 # =====================================================
@@ -113,6 +119,7 @@ html, body, [class*="css"] { font-family: 'Figtree', sans-serif; }
 [data-testid="stSidebar"] { background: radial-gradient(500px 300px at 0% 0%, @a@66, transparent 60%),
   radial-gradient(400px 300px at 100% 100%, @b@44, transparent 60%), @side@; border-right:1px solid @a@44; }
 [data-testid="stSidebar"] * { color:@soft@ !important; }
+[data-testid="stSidebar"] input { color:@ink@ !important; background:#ffffff !important; }
 [data-testid="stSidebar"] [data-testid="stRadio"] label { background:#ffffff0d; border:1px solid #ffffff1c;
   border-radius:14px; padding:10px 14px; margin-bottom:8px; transition:all .15s ease; }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { background:#ffffff1c; transform:translateX(3px); }
@@ -202,23 +209,47 @@ st.markdown(build_css(), unsafe_allow_html=True)
 # =====================================================
 
 def queue_ahead(ticket):
+    return db.position_info(ticket)["ahead"]
 
-    rows = db.list_tickets(
-        service=ticket["service"],
-        statuses=["Waiting", "Serving"]
-    )
 
-    ahead = 0
+def estimate_for(ticket):
+    """(position info, low, expected, high) wait for one waiting ticket."""
+    info = db.position_info(ticket)
+    low, mid, high = predict_wait_range(wait_model, ticket["service"], info["load"], info["counters"])
+    return info, low, mid, high
 
-    for row in rows:
 
-        if row["ticket_code"] == ticket["ticket_code"]:
-            break
+def service_wait_now(service):
+    """(people waiting, expected minutes) a NEW customer would face in this service."""
+    waiting = db.list_tickets(service=service, statuses=["Waiting"])
+    serving = db.list_tickets(service=service, statuses=["Serving"])
+    counters = len({t["counter"] for t in serving}) or 1
+    load = len(waiting) + 0.5 * len(serving)
+    return len(waiting), predict_wait_range(wait_model, service, load, counters)[1]
 
-        if row["status"] in ("Waiting", "Serving"):
-            ahead += 1
 
-    return ahead
+def join_url():
+    return db.get_settings()["public_url"].rstrip("/") + "/?join=1"
+
+
+@st.cache_data(show_spinner=False)
+def qr_png(url):
+    """PNG bytes of a QR code, or None if the optional `qrcode` package is not installed."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    qrcode.make(url).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def show_qr(width=170):
+    png = qr_png(join_url())
+    if png:
+        st.image(png, width=width, caption="Scan to join the queue")
+    else:
+        st.caption("Install the QR package to show a join code here: `pip install qrcode[pil]`")
 
 
 def metric_card(label, value, foot, icon):
@@ -273,16 +304,13 @@ def ticket_details(code):
 
         return None
 
-    ahead = queue_ahead(ticket) if ticket["status"] == "Waiting" else 0
+    info = low = mid = high = None
 
-    estimate = (
-        predict_wait(wait_model, ticket["service"], ahead)
-        if ticket["status"] == "Waiting"
-        else 0
-    )
+    if ticket["status"] == "Waiting":
+
+        info, low, mid, high = estimate_for(ticket)
 
     with st.container(key="panel_1"):
-
 
         left, right = st.columns([2, 1])
 
@@ -291,36 +319,48 @@ def ticket_details(code):
             st.caption("YOUR QUEUE TICKET")
 
             st.markdown(
-                f'<div class="ticket-code">{ticket["ticket_code"]}</div>',
+                f'<div class="ticket-code">{html.escape(ticket["ticket_code"])}</div>',
                 unsafe_allow_html=True
             )
 
             st.write(f"**{ticket['service']}** · {ticket['customer_name']}")
 
+            st.caption(f"Joined at {ticket['created_at'][11:16]}")
+
         with right:
 
             st.caption("CURRENT STATUS")
 
-            st.markdown(
-                f'<span class="status-pill">{ticket["status"].upper()}</span>',
-                unsafe_allow_html=True
-            )
+            pills = f'<span class="status-pill">{html.escape(ticket["status"].upper())}</span>'
+
+            if ticket["priority"]:
+                pills += ' <span class="status-pill">★ PRIORITY</span>'
+
+            st.markdown(pills, unsafe_allow_html=True)
 
         if ticket["status"] == "Waiting":
 
-            a, b = st.columns(2)
+            a, b, c = st.columns(3)
 
-            a.metric("People ahead", ahead)
+            a.metric("People ahead", info["ahead"])
 
-            b.metric("AI wait estimate", f"{estimate} min")
+            b.metric("Estimated wait", f"{low}–{high} min" if high > low else f"~{mid} min")
+
+            c.metric("Your position", f"#{info['waiting_ahead'] + 1}")
+
+            st.progress(min(1.0, 1 / (info["waiting_ahead"] + 1)))
+
+            if info["waiting_ahead"] == 0:
+
+                st.success("You're next! Please make your way to the service area.")
 
             st.markdown("""
             <div class="ai-banner">
                 <span class="ai-dot"></span>
                 <b>AI prediction</b><br>
                 <span style="font-size:12px">
-                Your estimated wait is based on the selected service
-                and the current queue. Actual times may vary.
+                Based on the service, the time of day and how many counters are open.
+                This page refreshes by itself. Actual times may vary.
                 </span>
             </div>
             """, unsafe_allow_html=True)
@@ -333,12 +373,103 @@ def ticket_details(code):
 
             st.success("Your service is complete. Thank you for choosing WaitWise.")
 
+        elif ticket["status"] == "No-show":
+
+            st.warning("You were called but we couldn't reach you, so this ticket was closed. "
+                       "You're welcome to take a new one.")
+
         else:
 
             st.warning("This ticket has been cancelled.")
 
+        messages = db.ticket_notifications(ticket["ticket_code"])
+
+        if messages:
+
+            with st.expander("Messages for this ticket"):
+
+                for n in messages:
+                    st.caption(f"{n['created_at'][11:16]} · {n['message']}")
 
     return ticket
+
+
+def _ticket_panel_body(code):
+    """Ticket card + cancel + feedback. Shared by the live (auto-refreshing) and static versions."""
+
+    ticket = ticket_details(code)
+
+    if not ticket:
+        return
+
+    tcode = ticket["ticket_code"]
+    prev = st.session_state.get(f"seen_{tcode}")
+    st.session_state[f"seen_{tcode}"] = ticket["status"]
+
+    if prev == "Waiting" and ticket["status"] == "Serving":
+        st.toast(f"🔔 It's your turn! Go to {ticket['counter'] or 'the service desk'}.")
+
+    live = ("Waiting", "Serving")
+
+    if prev in live and ticket["status"] not in live:
+        st.rerun()  # swap the auto-refreshing panel for the static one
+
+    if ticket["status"] == "Waiting":
+
+        if st.button("Cancel this ticket", key=f"cancel_{tcode}"):
+
+            if db.cancel_ticket(tcode):
+
+                st.success("Your ticket has been cancelled.")
+
+                st.rerun()
+
+            else:
+
+                st.error("This ticket can no longer be cancelled.")
+
+    if ticket["status"] == "Completed":
+
+        if db.has_feedback(tcode):
+
+            st.caption("✓ Your feedback was received. Thank you!")
+
+        else:
+
+            st.markdown("**How was your experience?**")
+
+            with st.form(f"feedback_{tcode}"):
+
+                rating = st.slider("Rating", 1, 5, 5)
+
+                comment = st.text_area("Share feedback (optional)")
+
+                if st.form_submit_button("Submit feedback"):
+
+                    if db.add_feedback(tcode, rating, comment):
+                        st.success("Thanks for helping us improve!")
+                        st.rerun()
+
+
+@st.fragment(run_every=8)
+def _live_ticket_panel(code):
+    _ticket_panel_body(code)
+
+
+@st.fragment
+def _static_ticket_panel(code):
+    _ticket_panel_body(code)
+
+
+def ticket_panel(code):
+    """Shows a ticket. While it is Waiting/Serving the panel refreshes itself every 8 seconds."""
+
+    ticket = db.get_ticket(code)
+
+    if ticket and not ticket["is_deleted"] and ticket["status"] in ("Waiting", "Serving"):
+        _live_ticket_panel(code)
+    else:
+        _static_ticket_panel(code)
 
 
 COUNTERS = ["Counter 1", "Counter 2", "Counter 3", "Counter 4"]
@@ -355,25 +486,17 @@ def hero(chip, title, text):
     """, unsafe_allow_html=True)
 
 
-def require_pin(role, env_name, default):
-    """Simple PIN gate. Change the PIN with an environment variable (ADMIN_PIN / MANAGER_PIN)."""
+def require_role(*roles):
+    """Staff pages: only a signed-in account with one of these roles gets in."""
 
-    key = f"auth_{role}"
+    user = st.session_state.get("user")
 
-    if st.session_state.get(key):
+    if user and user["role"] in roles:
         return True
 
-    hero(role.upper(), f"{role.capitalize()} sign-in", "Enter your PIN to continue.")
-
-    pin = st.text_input(f"{role.capitalize()} PIN", type="password", key=f"pin_{role}")
-
-    if st.button("Unlock"):
-
-        if pin == os.getenv(env_name, default):
-            st.session_state[key] = True
-            st.rerun()
-        else:
-            st.error("Wrong PIN. Try again.")
+    hero("STAFF ONLY", "Please sign in",
+         "This area is for staff. Use “Staff sign-in” in the sidebar. "
+         "Customers don't need to sign in.")
 
     return False
 
@@ -387,6 +510,14 @@ def tv_board():
 
     hero("NOW SERVING", "Please go to your counter when your number appears",
          "This screen updates automatically.")
+
+    cfg = db.get_settings()
+
+    if cfg["announcement"]:
+        st.warning("📢 " + cfg["announcement"])
+
+    if cfg["queue_open"] != "1":
+        st.error("⏸ New tickets are paused for the moment.")
 
     if serving:
 
@@ -420,11 +551,12 @@ def tv_board():
 
             for t in waiting[:6]:
 
-                est = predict_wait(wait_model, t["service"], queue_ahead(t))
+                _, _, est, _ = estimate_for(t)
+                star = "★ " if t["priority"] else ""
 
                 st.markdown(f"""
                 <div class="tv-row">
-                    <span class="tv-code">{html.escape(t["ticket_code"])}</span>
+                    <span class="tv-code">{star}{html.escape(t["ticket_code"])}</span>
                     <span>{html.escape(t["service"])}</span>
                     <span>~{est} min</span>
                 </div>
@@ -440,13 +572,46 @@ def tv_board():
 
         for service in SERVICES:
 
-            n = sum(1 for t in waiting if t["service"] == service)
-            metric_card(service, n, "people waiting", "⏳")
+            n, minutes = service_wait_now(service)
+            metric_card(service, n, f"people waiting · ~{minutes} min for a new ticket", "⏳")
+
+        show_qr(150)
 
 
 # =====================================================
 # SIDEBAR NAVIGATION
 # =====================================================
+
+PAGES = ["Queue Display", "Customer Portal", "Admin Panel", "Manager Database"]
+PUBLIC_PAGES = ["Queue Display", "Customer Portal"]            # no login, for everyone
+ROLE_PAGES = {"admin": ["Admin Panel"], "manager": ["Admin Panel", "Manager Database"]}
+
+# drop the session of an account that was disabled or removed meanwhile
+USER = st.session_state.get("user")
+if USER:
+    _role = db.user_role(USER["username"])
+    if _role:
+        USER = st.session_state["user"] = {"username": USER["username"], "role": _role}
+    else:
+        USER = None
+        st.session_state.pop("user", None)
+
+visible_pages = PUBLIC_PAGES + (ROLE_PAGES.get(USER["role"], []) if USER else [])
+
+if "page" not in st.session_state:
+    # a QR code (?join=1) or a saved ticket link (?ticket=WW-0001) opens the Customer Portal directly
+    st.session_state["page"] = ("Customer Portal"
+                                if (st.query_params.get("join") or st.query_params.get("ticket"))
+                                else "Queue Display")
+
+if "_goto" in st.session_state:
+    st.session_state["page"] = st.session_state.pop("_goto")
+
+if st.session_state["page"] not in visible_pages:
+    st.session_state["page"] = "Queue Display"
+
+if st.query_params.get("ticket") and not st.session_state.get("lookup_ticket"):
+    st.session_state["lookup_ticket"] = str(st.query_params["ticket"]).upper().strip()
 
 with st.sidebar:
 
@@ -470,14 +635,60 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        [
-            "Queue Display",
-            "Customer Portal",
-            "Admin Panel",
-            "Manager Database"
-        ],
+        visible_pages,
+        key="page",
         label_visibility="collapsed"
     )
+
+    st.markdown("""
+    <div style='color:#91a2c2;font-size:10px;font-weight:800;letter-spacing:1.5px;margin:18px 0 10px'>
+        ACCESS
+    </div>
+    """, unsafe_allow_html=True)
+
+    if USER:
+
+        st.markdown(f"Signed in as **{html.escape(USER['username'])}** · {USER['role']}")
+
+        if st.button("Sign out", key="staff_signout"):
+            st.session_state.pop("user", None)
+            st.session_state["_goto"] = "Queue Display"
+            st.rerun()
+
+    else:
+
+        st.caption("Customers: no login needed. Just open the Customer Portal.")
+
+        with st.expander("🔐 Staff sign-in"):
+
+            with st.form("staff_login"):
+
+                login_user = st.text_input("Username")
+                login_pass = st.text_input("Password", type="password")
+
+                if st.form_submit_button("Sign in"):
+
+                    wait = int(st.session_state.get("lock_staff", 0) - time.time())
+
+                    if wait > 0:
+                        st.error(f"Too many wrong attempts. Try again in {wait} s.")
+
+                    else:
+                        role = db.verify_user(login_user, login_pass)
+
+                        if role:
+                            st.session_state["user"] = {"username": login_user.strip().lower(), "role": role}
+                            st.session_state["fails_staff"] = 0
+                            st.session_state["_goto"] = "Admin Panel"
+                            st.rerun()
+                        else:
+                            fails = st.session_state.get("fails_staff", 0) + 1
+                            st.session_state["fails_staff"] = fails
+                            if fails >= 5:
+                                st.session_state["lock_staff"] = time.time() + 60
+                                st.session_state["fails_staff"] = 0
+                            time.sleep(0.5)
+                            st.error("Wrong username or password.")
 
     st.markdown("""
     <div style='color:#91a2c2;font-size:10px;font-weight:800;letter-spacing:1.5px;margin:18px 0 10px'>
@@ -568,16 +779,35 @@ elif page == "Customer Portal":
                 </div>
             """, unsafe_allow_html=True)
 
+            cfg = db.get_settings()
+
+            if cfg["announcement"]:
+                st.info("📢 " + cfg["announcement"])
+
+            if cfg["queue_open"] != "1":
+                st.warning("⏸ New tickets are paused for the moment. Please ask at the service desk.")
+
             with st.form("new_ticket_form", clear_on_submit=True):
 
                 name = st.text_input(
                     "Full name",
-                    placeholder="Enter your name"
+                    placeholder="Enter your name",
+                    max_chars=60
                 )
 
                 service = st.selectbox(
                     "Service category",
                     SERVICES
+                )
+
+                phone = st.text_input(
+                    "Mobile number (optional)",
+                    placeholder="+383 44 123 456",
+                    help="We'll text you when you're next and when it's your turn."
+                )
+
+                priority = st.checkbox(
+                    "I need priority service (senior, pregnant, disability, with a baby)"
                 )
 
                 submitted = st.form_submit_button(
@@ -595,13 +825,38 @@ elif page == "Customer Portal":
 
                 else:
 
-                    code = db.create_ticket(name, service)
+                    existing = db.find_active_ticket(name, service)
 
-                    st.session_state["last_ticket"] = code
-                    st.session_state["lookup_ticket"] = code
+                    if existing:
 
-                    st.success(f"Ticket created: {code}")
+                        st.session_state["lookup_ticket"] = existing["ticket_code"]
 
+                        st.info(
+                            f"{name.strip()} already has ticket {existing['ticket_code']} in this queue. "
+                            "It is shown on the right."
+                        )
+
+                    else:
+
+                        try:
+
+                            code = db.create_ticket(name, service, priority=priority, phone=phone)
+
+                        except db.QueueClosed as e:
+
+                            st.warning(str(e))
+
+                        except ValueError as e:
+
+                            st.error(str(e))
+
+                        else:
+
+                            st.session_state["last_ticket"] = code
+                            st.session_state["lookup_ticket"] = code
+                            st.query_params["ticket"] = code  # bookmark / refresh keeps the ticket
+
+                            st.success(f"Ticket created: {code}")
 
         with st.container(key="panel_4"):
 
@@ -631,11 +886,21 @@ elif page == "Customer Portal":
 
             for item, detail in services_info:
 
+                n_waiting, minutes = service_wait_now(item)
+
                 st.markdown(f"""
                 <div style="padding:10px 0;border-bottom:1px solid #eef1f6">
 
-                    <div style="font-size:13px;font-weight:700;color:#263653">
-                        {item}
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+
+                        <div style="font-size:13px;font-weight:700;color:#263653">
+                            {item}
+                        </div>
+
+                        <div style="font-size:12px;font-weight:700;color:var(--a)">
+                            {n_waiting} waiting · ~{minutes} min
+                        </div>
+
                     </div>
 
                     <div style="font-size:11px;color:#8b98ad">
@@ -644,7 +909,6 @@ elif page == "Customer Portal":
 
                 </div>
                 """, unsafe_allow_html=True)
-
 
     with track_col:
 
@@ -659,7 +923,8 @@ elif page == "Customer Portal":
                 </div>
             """, unsafe_allow_html=True)
 
-            default_code = st.session_state.get("last_ticket", "")
+            default_code = (st.session_state.get("lookup_ticket")
+                            or st.session_state.get("last_ticket", ""))
 
             code = st.text_input(
                 "Ticket reference",
@@ -673,15 +938,14 @@ elif page == "Customer Portal":
                 **STRETCH_BTN
             ):
 
-                st.session_state["lookup_ticket"] = code
+                st.session_state["lookup_ticket"] = code.strip().upper()
 
-            current_ticket = None
+                if code.strip():
+                    st.query_params["ticket"] = code.strip().upper()
 
             if st.session_state.get("lookup_ticket"):
 
-                current_ticket = ticket_details(
-                    st.session_state["lookup_ticket"]
-                )
+                ticket_panel(st.session_state["lookup_ticket"])
 
             else:
 
@@ -700,51 +964,6 @@ elif page == "Customer Portal":
 
                 </div>
                 """, unsafe_allow_html=True)
-
-            if current_ticket and current_ticket["status"] == "Waiting":
-
-                if st.button("Cancel this ticket"):
-
-                    if db.cancel_ticket(current_ticket["ticket_code"]):
-
-                        st.success("Your ticket has been cancelled.")
-
-                        st.rerun()
-
-                    else:
-
-                        st.error(
-                            "This ticket can no longer be cancelled."
-                        )
-
-            if current_ticket and current_ticket["status"] == "Completed":
-
-                st.markdown("**How was your experience?**")
-
-                with st.form("feedback_form"):
-
-                    rating = st.slider(
-                        "Rating",
-                        1,
-                        5,
-                        5
-                    )
-
-                    comment = st.text_area(
-                        "Share feedback (optional)"
-                    )
-
-                    if st.form_submit_button("Submit feedback"):
-
-                        db.add_feedback(
-                            current_ticket["ticket_code"],
-                            rating,
-                            comment
-                        )
-
-                        st.success(
-                            "Thanks for helping us improve!"
-                        )
 
 
     st.write("")
@@ -791,10 +1010,17 @@ elif page == "Customer Portal":
 
                 if prompt.strip():
 
+                    chat_info = {}
+
+                    if ticket_for_chat and ticket_for_chat["status"] == "Waiting":
+                        pos, low, _, high = estimate_for(ticket_for_chat)
+                        chat_info = {"ahead": pos["ahead"], "wait_low": low, "wait_high": high}
+
                     st.session_state["chat_answer"] = chatbot_reply(
                         chatbot,
                         prompt,
-                        ticket_for_chat
+                        ticket_for_chat,
+                        chat_info
                     )
 
                 else:
@@ -811,7 +1037,7 @@ elif page == "Customer Portal":
                     <b>WaitWise AI</b><br>
 
                     <span style="font-size:13px">
-                        {st.session_state["chat_answer"]}
+                        {html.escape(st.session_state["chat_answer"])}
                     </span>
 
                 </div>
@@ -831,13 +1057,13 @@ elif page == "Customer Portal":
 
 elif page == "Admin Panel":
 
-    if not require_pin("admin", "ADMIN_PIN", "1234"):
+    if not require_role("admin", "manager"):
         st.stop()
 
     hero("ADMIN", "See everything. Keep service moving.",
          "Run your counter, watch the analytics and review every record, including the ones flagged as deleted.")
 
-    desk, analytics, records = st.tabs(["Counter desk", "Analytics", "All records"])
+    desk, analytics, records, settings_tab = st.tabs(["Counter desk", "Analytics", "All records", "Settings & Outbox"])
 
     with desk:
 
@@ -847,57 +1073,152 @@ elif page == "Admin Panel":
 
         waiting = db.list_tickets(service=service, statuses=["Waiting"])
         mine = [t for t in db.list_tickets(service=service, statuses=["Serving"]) if t["counter"] == counter]
+        _, new_wait = service_wait_now(service)
 
-        m1, m2 = st.columns(2)
+        m1, m2, m3 = st.columns(3)
         with m1:
             metric_card("Waiting", len(waiting), "In this queue", "⏳")
         with m2:
-            metric_card("Next ticket", waiting[0]["ticket_code"] if waiting else "—", "First in line", "🎟️")
+            next_label = ("★ " if waiting and waiting[0]["priority"] else "") + (waiting[0]["ticket_code"] if waiting else "—")
+            metric_card("Next ticket", next_label, "Priority first, then first-come", "🎟️")
+        with m3:
+            metric_card("Wait for a new ticket", f"~{new_wait} min", "AI estimate", "🧠")
 
         st.write("")
 
         if mine:
-            st.markdown(f'<div class="ticket-code">{mine[0]["ticket_code"]}</div>', unsafe_allow_html=True)
-            st.write(f"**{mine[0]['customer_name']}** at {counter}")
-            if st.button("✓ Complete service", **STRETCH_BTN):
-                if db.complete_ticket(mine[0]["ticket_code"]):
+            t = mine[0]
+            st.markdown(f'<div class="ticket-code">{html.escape(t["ticket_code"])}</div>', unsafe_allow_html=True)
+            st.write(f"**{t['customer_name']}** at {counter}"
+                     + (" · ★ Priority" if t["priority"] else "")
+                     + (f" · 📱 {t['phone']}" if t["phone"] else ""))
+
+            b1, b2, b3 = st.columns(3)
+
+            if b1.button("✓ Complete", type="primary", **STRETCH_BTN):
+                if db.complete_ticket(t["ticket_code"]):
                     st.cache_resource.clear()
+                    st.rerun()
+
+            if b2.button("🔔 Recall", **STRETCH_BTN):
+                if db.recall_ticket(t["ticket_code"]):
+                    st.toast(f"{t['ticket_code']} re-announced.")
+
+            if b3.button("🚫 No-show", **STRETCH_BTN):
+                if db.mark_no_show(t["ticket_code"]):
+                    st.rerun()
+
+            x1, x2 = st.columns([2, 1])
+            target = x1.selectbox("Transfer this customer to another service",
+                                  [x for x in SERVICES if x != service], key="xfer_target")
+            if x2.button("Transfer", **STRETCH_BTN):
+                if db.transfer_ticket(t["ticket_code"], target):
+                    st.toast(f"{t['ticket_code']} moved to {target}.")
                     st.rerun()
         else:
             st.info(f"{counter} has no active customer.")
 
-        if st.button("Call next customer  →", type="primary", **STRETCH_BTN):
+        if st.button("Call next customer  →", type="primary", disabled=bool(mine), **STRETCH_BTN):
             code = db.call_next(service, counter)
             if code:
                 st.rerun()
             else:
                 st.warning("There are no waiting tickets for this service.")
 
+        if mine:
+            st.caption("Finish, recall or close the current customer before calling the next one.")
+
         if waiting:
-            st.dataframe(pd.DataFrame([dict(r) for r in waiting])[["ticket_code", "customer_name", "created_at"]],
+            wdf = pd.DataFrame([dict(r) for r in waiting])
+            wdf["priority"] = wdf["priority"].map({1: "★ Priority", 0: ""})
+            st.dataframe(wdf[["ticket_code", "customer_name", "priority", "phone", "created_at"]],
                          hide_index=True, **STRETCH_DF)
 
     with analytics:
 
         stats = db.get_stats()
-        cols = st.columns(5)
+        cols = st.columns(6)
         for col, (label, key, icon) in zip(cols, [("Total", "total", "🎟️"), ("Waiting", "waiting", "⏳"),
                                                   ("Serving", "serving", "🟢"), ("Completed", "completed", "✓"),
-                                                  ("Flagged deleted", "deleted", "🗑")]):
+                                                  ("No-shows", "no_show", "🚫"), ("Flagged deleted", "deleted", "🗑")]):
             with col:
                 metric_card(label, stats[key], "Active records" if key != "deleted" else "Kept in database", icon)
 
+        st.write("")
+        period = st.selectbox("Period for the figures below", ["Today", "Last 7 days", "All time"], key="an_period")
+
         rows = db.list_tickets(limit=5000)
-        if rows:
-            df = pd.DataFrame([dict(r) for r in rows])
+        df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+
+        if not df.empty:
+            df["created"] = pd.to_datetime(df["created_at"], errors="coerce")
+            df["called"] = pd.to_datetime(df["called_at"], errors="coerce")
+            df["wait_min"] = (df["called"] - df["created"]).dt.total_seconds() / 60
+            now = pd.Timestamp.now()
+            if period == "Today":
+                df = df[df["created"].dt.date == now.date()]
+            elif period == "Last 7 days":
+                df = df[df["created"] >= now - pd.Timedelta(days=7)]
+
+        if not df.empty:
+
+            feedback = pd.DataFrame([dict(r) for r in db.all_feedback()])
+            closed = df["status"].isin(["Completed", "No-show"]).sum()
+            no_show_rate = (df["status"] == "No-show").sum() / closed * 100 if closed else 0
+            avg_wait = df["wait_min"].dropna().clip(lower=0).mean()
+            avg_service = df["service_minutes"].dropna().mean()
+            rating = feedback["rating"].mean() if not feedback.empty else None
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                metric_card("Avg. wait", f"{avg_wait:.1f} min" if pd.notna(avg_wait) else "—", "Joined → called", "⏱")
+            with k2:
+                metric_card("Avg. service", f"{avg_service:.1f} min" if pd.notna(avg_service) else "—", "At the counter", "🛎")
+            with k3:
+                metric_card("No-show rate", f"{no_show_rate:.0f}%", "Of called customers", "🚫")
+            with k4:
+                metric_card("Satisfaction", f"{rating:.1f} / 5" if rating is not None else "—",
+                            f"{len(feedback)} reviews" if not feedback.empty else "No reviews yet", "⭐")
+
+            st.write("")
             a, b = st.columns(2)
-            a.bar_chart(df.groupby("service").size().rename("Tickets"), color=THEME["a"])
-            b.bar_chart(df["status"].value_counts().rename("Tickets"), color=THEME["b"])
+            a.markdown("**Tickets by hour of day**")
+            by_hour = df.dropna(subset=["created"]).groupby(df["created"].dt.hour).size().rename("Tickets")
+            if not by_hour.empty:
+                a.bar_chart(by_hour, color=THEME["a"])
+            b.markdown("**Average wait by service (min)**")
+            by_wait = df.groupby("service")["wait_min"].mean().dropna().clip(lower=0).rename("Minutes")
+            if not by_wait.empty:
+                b.bar_chart(by_wait, color=THEME["b"])
+            else:
+                b.caption("Shown once customers have been called.")
+
+            c, d = st.columns(2)
+            c.markdown("**Tickets by service**")
+            c.bar_chart(df.groupby("service").size().rename("Tickets"), color=THEME["a"])
+            d.markdown("**Tickets by status**")
+            d.bar_chart(df["status"].value_counts().rename("Tickets"), color=THEME["b"])
+
+            perf = df[df["counter"].notna() & df["status"].isin(["Completed", "No-show"])]
+            if not perf.empty:
+                st.markdown("**Counter performance**")
+                table = perf.groupby("counter").agg(
+                    served=("status", lambda x: int((x == "Completed").sum())),
+                    no_shows=("status", lambda x: int((x == "No-show").sum())),
+                    avg_service_min=("service_minutes", "mean")).round(1)
+                st.dataframe(table, **STRETCH_DF)
+
+            st.download_button("⬇ Download these tickets (CSV)",
+                               df.drop(columns=["created", "called"]).to_csv(index=False).encode("utf-8"),
+                               "waitwise_tickets.csv", "text/csv")
         else:
             st.info("Analytics will appear after customers start creating tickets.")
 
         if using_real_history:
-            st.success("Wait-time model is trained on completed tickets from this database.")
+            msg = "Wait-time model is trained on completed tickets from this database."
+            if model_mae is not None:
+                msg += f" Typical error on unseen tickets: ±{model_mae:.1f} min (cross-validated)."
+            st.success(msg)
         else:
             st.info("Wait-time model uses demo data until 5 real completed tickets exist.")
 
@@ -918,13 +1239,61 @@ elif page == "Admin Panel":
             st.info("No records yet.")
 
 
+    with settings_tab:
+
+        cfg = db.get_settings()
+
+        st.markdown("**Queue controls**")
+
+        with st.form("settings_form"):
+            is_open = st.toggle("Accept new tickets", value=cfg["queue_open"] == "1")
+            cap = st.number_input("Max people waiting per service (0 = no limit)", min_value=0, max_value=500,
+                                  value=int(cfg["max_waiting"] or 0), step=1)
+            note = st.text_input("Announcement (shown on the TV board and customer portal)",
+                                 value=cfg["announcement"], max_chars=160)
+            url = st.text_input("Public app address (used for the QR code)", value=cfg["public_url"])
+
+            if st.form_submit_button("Save settings", **STRETCH_BTN):
+                if not url.strip().lower().startswith(("http://", "https://")):
+                    st.error("The address must start with http:// or https://")
+                else:
+                    db.set_setting("queue_open", "1" if is_open else "0")
+                    db.set_setting("max_waiting", int(cap))
+                    db.set_setting("announcement", note.strip())
+                    db.set_setting("public_url", url.strip())
+                    st.success("Settings saved.")
+
+        st.markdown("**Join by QR code**")
+        st.caption("Print it and put it at the entrance. Customers' phones must be able to reach the address above "
+                   "(for example http://192.168.1.20:8501 on the same Wi-Fi).")
+        show_qr(190)
+        png = qr_png(join_url())
+        if png:
+            st.download_button("⬇ Download QR (PNG)", png, "waitwise_join_qr.png", "image/png")
+        st.code(join_url())
+
+        st.markdown("**Notifications**")
+        if notifier.sms_enabled():
+            st.success("Real SMS is enabled (Twilio).")
+        else:
+            st.info("SMS is not configured, so messages are only logged here. "
+                    "Set the Twilio variables described in notifier.py to send real texts.")
+
+        outbox = db.recent_notifications(100)
+        if outbox:
+            st.dataframe(pd.DataFrame([dict(r) for r in outbox])[["created_at", "ticket_code", "channel", "phone", "message"]],
+                         hide_index=True, **STRETCH_DF)
+        else:
+            st.caption("No notifications yet.")
+
+
 # =====================================================
 # PANEL 3: MANAGER DATABASE
 # =====================================================
 
 elif page == "Manager Database":
 
-    if not require_pin("manager", "MANAGER_PIN", "5678"):
+    if not require_role("manager"):
         st.stop()
 
     hero("MANAGER", "Your database, fully in your hands.",
@@ -933,7 +1302,7 @@ elif page == "Manager Database":
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
 
-    t_edit, t_add, t_fb = st.tabs(["Edit tickets", "Add ticket", "Feedback"])
+    t_edit, t_add, t_fb, t_staff = st.tabs(["Edit tickets", "Add ticket", "Feedback", "Staff accounts"])
 
     with t_edit:
 
@@ -941,10 +1310,11 @@ elif page == "Manager Database":
 
         if rows:
 
-            cols = ["id", "ticket_code", "customer_name", "service", "status", "counter",
+            cols = ["id", "ticket_code", "customer_name", "service", "status", "priority", "phone", "counter",
                     "service_minutes", "created_at", "is_deleted", "deleted_at", "deleted_by"]
             df = pd.DataFrame([dict(r) for r in rows])[cols]
             df["is_deleted"] = df["is_deleted"].astype(bool)
+            df["priority"] = df["priority"].astype(bool)
 
             st.caption("Double-click a cell to edit. Tick “Flag as deleted” instead of deleting: "
                        "the row stays in the database and the admin sees it marked as deleted. Untick to restore.")
@@ -958,6 +1328,8 @@ elif page == "Manager Database":
                     "counter": st.column_config.SelectboxColumn("Counter", options=COUNTERS),
                     "service_minutes": st.column_config.NumberColumn("Service minutes", min_value=0.0),
                     "is_deleted": st.column_config.CheckboxColumn("Flag as deleted"),
+                    "priority": st.column_config.CheckboxColumn("Priority"),
+                    "phone": st.column_config.TextColumn("Phone"),
                 })
 
             if st.button("Save changes", type="primary"):
@@ -973,11 +1345,12 @@ elif page == "Manager Database":
                     if new == before:
                         continue
                     try:
-                        fields = {k: new[k] for k in ("customer_name", "service", "status", "counter", "service_minutes")
+                        fields = {k: new[k] for k in ("customer_name", "service", "status", "counter", "service_minutes",
+                                                   "priority", "phone")
                                   if new[k] != before[k]}
                         db.update_ticket(int(new["id"]), fields)
                         if bool(new["is_deleted"]) != bool(before["is_deleted"]):
-                            db.set_deleted(int(new["id"]), bool(new["is_deleted"]), "Manager")
+                            db.set_deleted(int(new["id"]), bool(new["is_deleted"]), st.session_state["user"]["username"])
                         changed += 1
                     except ValueError as e:
                         errors.append(f"{new['ticket_code']}: {e}")
@@ -1002,11 +1375,13 @@ elif page == "Manager Database":
             n_service = st.selectbox("Service", SERVICES)
             n_status = st.selectbox("Status", db.STATUSES)
             n_counter = st.selectbox("Counter (optional)", ["—"] + COUNTERS)
+            n_priority = st.checkbox("Priority customer")
             if st.form_submit_button("Add ticket", **STRETCH_BTN):
                 if not n_name.strip():
                     st.error("Enter the customer name.")
                 else:
-                    code = db.add_ticket(n_name, n_service, n_status, None if n_counter == "—" else n_counter)
+                    code = db.add_ticket(n_name, n_service, n_status, None if n_counter == "—" else n_counter,
+                                         priority=n_priority)
                     st.session_state["flash"] = f"Added ticket {code}."
                     st.rerun()
 
@@ -1017,6 +1392,62 @@ elif page == "Manager Database":
             st.dataframe(pd.DataFrame([dict(r) for r in fb]), hide_index=True, **STRETCH_DF)
         else:
             st.info("No feedback yet.")
+
+
+    with t_staff:
+
+        me = st.session_state["user"]["username"]
+
+        if db.defaults_in_use():
+            st.warning("Some accounts still use the first-run default password. Reset them below.")
+
+        st.markdown("**Add a staff account**")
+
+        with st.form("add_user", clear_on_submit=True):
+            nu = st.text_input("Username")
+            nr = st.selectbox("Role", db.ROLES, help="admin = counter desk + analytics. manager = everything.")
+            npw = st.text_input("Password (min. 6 characters)", type="password")
+            if st.form_submit_button("Create account", **STRETCH_BTN):
+                try:
+                    db.create_user(nu, npw, nr)
+                    st.success(f"Account “{nu.strip().lower()}” created.")
+                except ValueError as e:
+                    st.error(str(e))
+
+        accounts = [u["username"] for u in db.list_users()]
+
+        st.markdown("**Reset a password**")
+
+        with st.form("reset_pw", clear_on_submit=True):
+            who = st.selectbox("Account", accounts)
+            new_pw = st.text_input("New password (min. 6 characters)", type="password")
+            if st.form_submit_button("Reset password", **STRETCH_BTN):
+                try:
+                    db.set_password(who, new_pw)
+                    st.success(f"Password for “{who}” updated.")
+                except ValueError as e:
+                    st.error(str(e))
+
+        st.markdown("**Enable / disable an account**")
+
+        with st.form("toggle_user"):
+            target = st.selectbox("Account", accounts, key="toggle_target")
+            t1, t2 = st.columns(2)
+            disable = t1.form_submit_button("Disable", **STRETCH_BTN)
+            enable = t2.form_submit_button("Enable", **STRETCH_BTN)
+            if disable or enable:
+                if disable and target == me:
+                    st.error("You can't disable the account you are signed in with.")
+                else:
+                    try:
+                        db.set_user_active(target, enable)
+                        st.success(f"“{target}” {'enabled' if enable else 'disabled'}.")
+                    except ValueError as e:
+                        st.error(str(e))
+
+        st.markdown("**Accounts**")
+        st.dataframe(pd.DataFrame([dict(u) for u in db.list_users()]).assign(
+            is_active=lambda d: d["is_active"].map({1: "Active", 0: "Disabled"})), hide_index=True, **STRETCH_DF)
 
 
 # =====================================================
