@@ -3,15 +3,16 @@ import html
 import inspect
 import io
 import os
+import re
 import time
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import database as db
 import notifier
+from config import SERVICES, COUNTERS, SERVICE_INFO
 from ai_engine import (
-    SERVICES,
     train_wait_model,
     predict_wait_range,
     wait_model_mae,
@@ -53,6 +54,7 @@ st.markdown = _html_safe_markdown
 
 
 db.init_db()
+db.maybe_backup()  # at most one backup per hour
 
 
 def _stretch(fn):
@@ -70,16 +72,27 @@ STRETCH_ED = _stretch(st.data_editor)
 # =====================================================
 
 @st.cache_resource(ttl=300)
-def load_ai():
+def load_wait_model():
     durations = db.completed_durations()
     wait_model, using_real_history = train_wait_model(durations)
-    chatbot = build_chatbot()
     mae = wait_model_mae(durations)
 
-    return wait_model, using_real_history, chatbot, mae
+    return wait_model, using_real_history, mae
 
 
-wait_model, using_real_history, chatbot, model_mae = load_ai()
+@st.cache_resource
+def load_chatbot():
+    return build_chatbot()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def defaults_warning():
+    """True while a first-run default password is still in use (PBKDF2 is slow, so don't redo it every click)."""
+    return db.defaults_in_use()
+
+
+wait_model, using_real_history, model_mae = load_wait_model()
+chatbot = load_chatbot()
 
 
 # =====================================================
@@ -94,12 +107,13 @@ THEMES = {
     "Ocean": dict(ink="#0B2E33", muted="#4F6F73", line="#CDEBE6", a="#0D9488", b="#0EA5E9", c="#F59E0B",
                   d="#065F5B", e="#0284C7", side="#062B2E", bg="#F0FBF9", ta="#CCFBF1", tb="#E0F2FE",
                   tc="#FEF3C7", soft="#D5F5F0"),
-    "Aurora": dict(ink="#1E1B4B", muted="#6B6890", line="#E4DFFB", a="#7C3AED", b="#EC4899", c="#06B6D4",
-                   d="#3B2FBF", e="#BE3FA6", side="#130F33", bg="#F7F5FF", ta="#F3E8FF", tb="#FCE7F3",
-                   tc="#CFFAFE", soft="#EDE9FE"),
-    "Sunset": dict(ink="#2D1B2E", muted="#7A6272", line="#F6DDD2", a="#EA580C", b="#DB2777", c="#FACC15",
-                   d="#9A3412", e="#BE185D", side="#2A1226", bg="#FFF7F2", ta="#FFEDD5", tb="#FCE7F3",
-                   tc="#FEF9C3", soft="#FFE4D6"),
+    # Aurora and Sunset use muted, dusty tones (the Ocean theme is left as it was)
+    "Aurora": dict(ink="#25223F", muted="#6E6A8A", line="#E3E0F0", a="#6B5FB5", b="#B5739E", c="#5FA3B5",
+                   d="#4A4296", e="#9A5C8C", side="#1C1A33", bg="#F6F5FA", ta="#ECE8F6", tb="#F4E8F0",
+                   tc="#E3F0F3", soft="#E6E2F3"),
+    "Sunset": dict(ink="#2F2128", muted="#7C6A68", line="#EBDDD3", a="#B8643F", b="#A8566F", c="#D9A441",
+                   d="#8A4B32", e="#9B4A62", side="#2B1B22", bg="#FAF5F1", ta="#F6E8DC", tb="#F3E4E6",
+                   tc="#F3EBD0", soft="#F2DDD0"),
 }
 
 THEME = THEMES.get(st.session_state.get("theme"), THEMES["Ocean"])
@@ -114,12 +128,24 @@ html, body, [class*="css"] { font-family: 'Figtree', sans-serif; }
   background: radial-gradient(900px 500px at 5% -5%, @ta@ 0%, transparent 60%),
               radial-gradient(800px 500px at 100% 0%, @tb@ 0%, transparent 55%),
               radial-gradient(700px 500px at 60% 100%, @tc@ 0%, transparent 60%), @bg@; }
-.block-container { padding-top:1.7rem; padding-bottom:3rem; max-width:1440px; }
+.block-container { padding-top:3.2rem; padding-bottom:3rem; max-width:1440px; }
+
+/* hide Streamlit's Deploy button and menu; the toolbar itself stays because it holds the sidebar open/close arrow */
+[data-testid="stHeader"] { background:transparent !important; }
+[data-testid="stExpandSidebarButton"] *, [data-testid="stSidebarCollapsedControl"] * { color:@a@ !important; fill:@a@ !important; }
+[data-testid="stToolbarActions"], [data-testid="stMainMenu"], [data-testid="stAppDeployButton"], .stDeployButton,
+[data-testid="stDecoration"], [data-testid="stStatusWidget"], #MainMenu { display:none !important; }
+[data-testid="stProgress"] [role="progressbar"] > div > div { background:var(--grad) !important; }
 
 [data-testid="stSidebar"] { background: radial-gradient(500px 300px at 0% 0%, @a@66, transparent 60%),
   radial-gradient(400px 300px at 100% 100%, @b@44, transparent 60%), @side@; border-right:1px solid @a@44; }
 [data-testid="stSidebar"] * { color:@soft@ !important; }
 [data-testid="stSidebar"] input { color:@ink@ !important; background:#ffffff !important; }
+[data-testid="stSidebar"] [data-testid="stRadio"] label p { font-size:17px !important; font-weight:600; }
+[data-testid="stSidebar"] [data-testid="stExpander"] summary p { font-size:17px !important; font-weight:600; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"], [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { font-size:14px !important; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p, [data-testid="stSidebar"] label p { font-size:15px; }
+[data-testid="stSidebar"] input { font-size:15px !important; }
 [data-testid="stSidebar"] [data-testid="stRadio"] label { background:#ffffff0d; border:1px solid #ffffff1c;
   border-radius:14px; padding:10px 14px; margin-bottom:8px; transition:all .15s ease; }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { background:#ffffff1c; transform:translateX(3px); }
@@ -130,8 +156,8 @@ html, body, [class*="css"] { font-family: 'Figtree', sans-serif; }
   justify-content:center; color:white; font-family:Outfit,sans-serif; font-size:23px; font-weight:800;
   box-shadow:0 10px 26px @a@88; }
 .brand-row { display:flex; align-items:center; gap:12px; margin:5px 0 24px; }
-.brand-name { color:white; font-family:Outfit,sans-serif; font-size:22px; font-weight:800; }
-.brand-sub { font-size:11px; letter-spacing:1.4px; text-transform:uppercase; }
+.brand-name { color:white; font-family:Outfit,sans-serif; font-size:25px; font-weight:800; }
+.brand-sub { font-size:12px; letter-spacing:1.4px; text-transform:uppercase; }
 
 .hero { background: radial-gradient(420px 260px at 90% 10%, @c@88, transparent 65%),
   radial-gradient(380px 260px at 55% 125%, @b@88, transparent 65%),
@@ -175,6 +201,11 @@ div.stButton > button, div.stFormSubmitButton > button { border-radius:14px; bor
   transition:transform .15s ease, box-shadow .15s ease, background-position .3s ease; }
 div.stButton > button:hover, div.stFormSubmitButton > button:hover { background-position:100% 0; color:white;
   transform:translateY(-2px); box-shadow:0 14px 28px @a@66; }
+div.stButton > button:active, div.stFormSubmitButton > button:active, div.stDownloadButton > button:active,
+div.stButton > button:focus, div.stFormSubmitButton > button:focus, div.stDownloadButton > button:focus,
+div.stButton > button:focus-visible, div.stFormSubmitButton > button:focus-visible, div.stDownloadButton > button:focus-visible {
+  background:@soft@ !important; color:@d@ !important; border:1px solid @a@55 !important;
+  box-shadow:0 0 0 3px @a@22 !important; outline:none !important; transform:none; }
 [data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea, [data-testid="stSelectbox"] div { border-radius:12px; }
 [data-testid="stTextInput"] input:focus, [data-testid="stTextArea"] textarea:focus {
   border-color:var(--a) !important; box-shadow:0 0 0 3px @a@33 !important; }
@@ -185,7 +216,7 @@ div[data-testid="stMetric"] { background:#ffffffd9; border:1px solid #fff; paddi
   box-shadow:0 10px 28px @a@14; }
 hr { border-color:var(--line); } .small-note { color:var(--muted); font-size:11px; } footer { visibility:hidden; }
 
-.tv-card { background:var(--grad); color:white; border-radius:24px; padding:24px; text-align:center; box-shadow:0 18px 44px @a@44; }
+.tv-card { margin-bottom:14px; background:var(--grad); color:white; border-radius:24px; padding:24px; text-align:center; box-shadow:0 18px 44px @a@44; }
 .tv-card .metric-label { color:#ffffffcc; }
 .tv-num { font-family:Outfit,sans-serif; font-size:68px; font-weight:800; line-height:1.1; margin:6px 0; }
 .tv-go { font-size:24px; font-weight:700; }
@@ -248,8 +279,52 @@ def show_qr(width=170):
     png = qr_png(join_url())
     if png:
         st.image(png, width=width, caption="Scan to join the queue")
+    elif st.session_state.get("user"):
+        st.caption("QR code unavailable: the `qrcode` package is missing. Run "
+                   "`python -m pip install \"qrcode[pil]\"` (or `pip install -r requirements.txt`) and restart the app.")
     else:
-        st.caption("Install the QR package to show a join code here: `pip install qrcode[pil]`")
+        st.caption(f"Join the queue at {join_url()}")
+
+
+def md_escape(text):
+    """Text typed by customers must never turn into formatting, links or images when shown via st.write."""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~$])", r"\\\1", str(text or ""))
+
+
+def mask_name(name):
+    """'Arben Krasniqi' -> 'A••• K•••'. Ticket codes are easy to guess, so strangers never see full names."""
+    return " ".join(w[0] + "•••" for w in str(name or "").split()) or "—"
+
+
+def is_owner(ticket):
+    """True for the person who created the ticket (this browser session, or their private ticket link)."""
+    code = ticket["ticket_code"]
+    if code in st.session_state.get("owned", set()):
+        return True
+    key = str(st.query_params.get("k", ""))
+    secret = ticket["secret"] or ""
+    if key and secret and hmac.compare_digest(key, secret):
+        st.session_state.setdefault("owned", set()).add(code)
+        return True
+    return False
+
+
+def minutes_since(iso):
+    try:
+        return max(0, int((datetime.now() - datetime.fromisoformat(iso)).total_seconds() // 60))
+    except (TypeError, ValueError):
+        return None
+
+
+def csv_safe(df):
+    """A name like =HYPERLINK(...) would run as a formula when the CSV is opened in Excel: force plain text."""
+    out = df.copy()
+    for col in out.columns:
+        # phone numbers are validated to digits and + - ( ) only, so they can't hide a formula
+        if col != "phone" and not pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].map(
+                lambda v: "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v)
+    return out
 
 
 def metric_card(label, value, foot, icon):
@@ -323,7 +398,9 @@ def ticket_details(code):
                 unsafe_allow_html=True
             )
 
-            st.write(f"**{ticket['service']}** · {ticket['customer_name']}")
+            shown_name = ticket["customer_name"] if is_owner(ticket) else mask_name(ticket["customer_name"])
+
+            st.write(f"**{ticket['service']}** · {md_escape(shown_name)}")
 
             st.caption(f"Joined at {ticket['created_at'][11:16]}")
 
@@ -349,6 +426,9 @@ def ticket_details(code):
             c.metric("Your position", f"#{info['waiting_ahead'] + 1}")
 
             st.progress(min(1.0, 1 / (info["waiting_ahead"] + 1)))
+
+            st.caption("Expected to be called around "
+                       f"{(datetime.now() + timedelta(minutes=mid)).strftime('%H:%M')} (estimate).")
 
             if info["waiting_ahead"] == 0:
 
@@ -382,7 +462,7 @@ def ticket_details(code):
 
             st.warning("This ticket has been cancelled.")
 
-        messages = db.ticket_notifications(ticket["ticket_code"])
+        messages = db.ticket_notifications(ticket["ticket_code"]) if is_owner(ticket) else []
 
         if messages:
 
@@ -414,7 +494,13 @@ def _ticket_panel_body(code):
     if prev in live and ticket["status"] not in live:
         st.rerun()  # swap the auto-refreshing panel for the static one
 
-    if ticket["status"] == "Waiting":
+    owner = is_owner(ticket)
+
+    if not owner and ticket["status"] in ("Waiting", "Completed"):
+        st.caption("Only the person who created this ticket can cancel it or review it. "
+                   "Use the link you were given when you joined, or ask at the service desk.")
+
+    if owner and ticket["status"] == "Waiting":
 
         if st.button("Cancel this ticket", key=f"cancel_{tcode}"):
 
@@ -428,7 +514,7 @@ def _ticket_panel_body(code):
 
                 st.error("This ticket can no longer be cancelled.")
 
-    if ticket["status"] == "Completed":
+    if owner and ticket["status"] == "Completed":
 
         if db.has_feedback(tcode):
 
@@ -472,7 +558,6 @@ def ticket_panel(code):
         _static_ticket_panel(code)
 
 
-COUNTERS = ["Counter 1", "Counter 2", "Counter 3", "Counter 4"]
 
 
 def hero(chip, title, text):
@@ -523,9 +608,9 @@ def tv_board():
 
         cols = st.columns(min(len(serving), 4))
 
-        for col, t in zip(cols, serving[:4]):
+        for i, t in enumerate(serving[:8]):
 
-            with col:
+            with cols[i % len(cols)]:
 
                 st.markdown(f"""
                 <div class="tv-card">
@@ -578,6 +663,37 @@ def tv_board():
         show_qr(150)
 
 
+@st.fragment(run_every=10)
+def desk_metrics(service):
+    """Counter-desk numbers refresh by themselves, so a new customer shows up without clicking."""
+    waiting = db.list_tickets(service=service, statuses=["Waiting"])
+    _, new_wait = service_wait_now(service)
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        metric_card("Waiting", len(waiting), "In this queue", "⏳")
+    with m2:
+        next_label = ("★ " if waiting and waiting[0]["priority"] else "") + (waiting[0]["ticket_code"] if waiting else "—")
+        metric_card("Next ticket", next_label, "Priority first, then first-come", "🎟️")
+    with m3:
+        metric_card("Wait for a new ticket", f"~{new_wait} min", "AI estimate", "🧠")
+
+    st.write("")
+
+
+@st.fragment(run_every=10)
+def desk_waiting_table(service):
+    waiting = db.list_tickets(service=service, statuses=["Waiting"])
+
+    if waiting:
+        wdf = pd.DataFrame([dict(r) for r in waiting])
+        wdf["priority"] = wdf["priority"].map({1: "★ Priority", 0: ""})
+        st.dataframe(wdf[["ticket_code", "customer_name", "priority", "phone", "created_at"]],
+                     hide_index=True, **STRETCH_DF)
+    else:
+        st.caption("Nobody is waiting in this queue.")
+
+
 # =====================================================
 # SIDEBAR NAVIGATION
 # =====================================================
@@ -587,12 +703,17 @@ PUBLIC_PAGES = ["Queue Display", "Customer Portal"]            # no login, for e
 ROLE_PAGES = {"admin": ["Admin Panel"], "manager": ["Admin Panel", "Manager Database"]}
 
 # drop the session of an account that was disabled or removed meanwhile
+STAFF_IDLE_SECONDS = 60 * 60   # staff are signed out after an hour without clicking anything
 USER = st.session_state.get("user")
 if USER:
     _role = db.user_role(USER["username"])
-    if _role:
+    _idle = time.time() - st.session_state.get("staff_seen", time.time())
+    if _role and _idle < STAFF_IDLE_SECONDS:
         USER = st.session_state["user"] = {"username": USER["username"], "role": _role}
+        st.session_state["staff_seen"] = time.time()
     else:
+        if _role:
+            st.session_state["signed_out_idle"] = True
         USER = None
         st.session_state.pop("user", None)
 
@@ -613,6 +734,48 @@ if st.session_state["page"] not in visible_pages:
 if st.query_params.get("ticket") and not st.session_state.get("lookup_ticket"):
     st.session_state["lookup_ticket"] = str(st.query_params["ticket"]).upper().strip()
 
+def staff_access(where):
+    """Staff sign-in / sign-out. Drawn in the sidebar and in the nav bar, so it is always reachable."""
+
+    if USER:
+
+        st.markdown(f"Signed in as **{html.escape(USER['username'])}** · {USER['role']}")
+
+        if st.button("Sign out", key=f"staff_signout_{where}"):
+            st.session_state.pop("user", None)
+            st.session_state["_goto"] = "Queue Display"
+            st.rerun()
+
+        return
+
+    st.caption("Customers: no login needed. Just open the Customer Portal.")
+
+    if st.session_state.get("signed_out_idle"):
+        st.info("You were signed out after an hour of inactivity.")
+
+    with st.form(f"staff_login_{where}"):
+
+        login_user = st.text_input("Username", key=f"login_user_{where}")
+        login_pass = st.text_input("Password", type="password", key=f"login_pass_{where}")
+
+        if st.form_submit_button("Sign in"):
+
+            role, wait = db.attempt_login(login_user, login_pass)
+
+            if wait:
+                st.error(f"Too many wrong attempts. Try again in {wait} s.")
+
+            elif role:
+                st.session_state["user"] = {"username": login_user.strip().lower(), "role": role}
+                st.session_state["staff_seen"] = time.time()
+                st.session_state["_goto"] = "Admin Panel"
+                st.rerun()
+
+            else:
+                time.sleep(0.5)
+                st.error("Wrong username or password.")
+
+
 with st.sidebar:
 
     st.markdown("""
@@ -627,7 +790,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("""
-    <div style='color:#91a2c2;font-size:10px;
+    <div style='color:#91a2c2;font-size:12px;
     font-weight:800;letter-spacing:1.5px;margin:8px 0 10px'>
         WORKSPACE
     </div>
@@ -641,57 +804,19 @@ with st.sidebar:
     )
 
     st.markdown("""
-    <div style='color:#91a2c2;font-size:10px;font-weight:800;letter-spacing:1.5px;margin:18px 0 10px'>
+    <div style='color:#91a2c2;font-size:12px;font-weight:800;letter-spacing:1.5px;margin:18px 0 10px'>
         ACCESS
     </div>
     """, unsafe_allow_html=True)
 
     if USER:
-
-        st.markdown(f"Signed in as **{html.escape(USER['username'])}** · {USER['role']}")
-
-        if st.button("Sign out", key="staff_signout"):
-            st.session_state.pop("user", None)
-            st.session_state["_goto"] = "Queue Display"
-            st.rerun()
-
+        staff_access("side")
     else:
-
-        st.caption("Customers: no login needed. Just open the Customer Portal.")
-
         with st.expander("🔐 Staff sign-in"):
-
-            with st.form("staff_login"):
-
-                login_user = st.text_input("Username")
-                login_pass = st.text_input("Password", type="password")
-
-                if st.form_submit_button("Sign in"):
-
-                    wait = int(st.session_state.get("lock_staff", 0) - time.time())
-
-                    if wait > 0:
-                        st.error(f"Too many wrong attempts. Try again in {wait} s.")
-
-                    else:
-                        role = db.verify_user(login_user, login_pass)
-
-                        if role:
-                            st.session_state["user"] = {"username": login_user.strip().lower(), "role": role}
-                            st.session_state["fails_staff"] = 0
-                            st.session_state["_goto"] = "Admin Panel"
-                            st.rerun()
-                        else:
-                            fails = st.session_state.get("fails_staff", 0) + 1
-                            st.session_state["fails_staff"] = fails
-                            if fails >= 5:
-                                st.session_state["lock_staff"] = time.time() + 60
-                                st.session_state["fails_staff"] = 0
-                            time.sleep(0.5)
-                            st.error("Wrong username or password.")
+            staff_access("side")
 
     st.markdown("""
-    <div style='color:#91a2c2;font-size:10px;font-weight:800;letter-spacing:1.5px;margin:18px 0 10px'>
+    <div style='color:#91a2c2;font-size:12px;font-weight:800;letter-spacing:1.5px;margin:18px 0 10px'>
         THEME
     </div>
     """, unsafe_allow_html=True)
@@ -702,19 +827,19 @@ with st.sidebar:
     <div style='height:15px'></div>
     <div style='border-top:1px solid #2b3853;
     padding-top:15px;color:#91a2c2;
-    font-size:10px;font-weight:800;letter-spacing:1.4px'>
+    font-size:12px;font-weight:800;letter-spacing:1.4px'>
         PLATFORM STATUS
     </div>
 
-    <div style='margin-top:12px;color:#d8e2f5;font-size:12px'>
+    <div style='margin-top:12px;color:#d8e2f5;font-size:14px'>
         🟢 Queue engine online
     </div>
 
-    <div style='margin-top:8px;color:#d8e2f5;font-size:12px'>
+    <div style='margin-top:8px;color:#d8e2f5;font-size:14px'>
         🧠 AI assistant ready
     </div>
 
-    <div style='margin-top:8px;color:#d8e2f5;font-size:12px'>
+    <div style='margin-top:8px;color:#d8e2f5;font-size:14px'>
         🗄️ SQLite connected
     </div>
 
@@ -725,6 +850,9 @@ with st.sidebar:
         Smart service. Less waiting.
     </div>
     """, unsafe_allow_html=True)
+
+
+st.session_state.pop("signed_out_idle", None)
 
 
 # =====================================================
@@ -803,7 +931,7 @@ elif page == "Customer Portal":
                 phone = st.text_input(
                     "Mobile number (optional)",
                     placeholder="+383 44 123 456",
-                    help="We'll text you when you're next and when it's your turn."
+                    help="We'll text you when you're next and when it's your turn. Use the international format (+383 ...) so the text can be delivered."
                 )
 
                 priority = st.checkbox(
@@ -825,7 +953,7 @@ elif page == "Customer Portal":
 
                 else:
 
-                    existing = db.find_active_ticket(name, service)
+                    existing = db.find_active_ticket(name, service, phone)
 
                     if existing:
 
@@ -840,7 +968,11 @@ elif page == "Customer Portal":
 
                         try:
 
+                            if time.time() - st.session_state.get("last_create_ts", 0) < 5:
+                                raise ValueError("Please wait a few seconds before creating another ticket.")
+
                             code = db.create_ticket(name, service, priority=priority, phone=phone)
+                            st.session_state["last_create_ts"] = time.time()
 
                         except db.QueueClosed as e:
 
@@ -855,6 +987,8 @@ elif page == "Customer Portal":
                             st.session_state["last_ticket"] = code
                             st.session_state["lookup_ticket"] = code
                             st.query_params["ticket"] = code  # bookmark / refresh keeps the ticket
+                            st.session_state.setdefault("owned", set()).add(code)  # this browser owns the ticket
+                            st.query_params["k"] = db.get_ticket(code)["secret"]  # private key in the saved link
 
                             st.success(f"Ticket created: {code}")
 
@@ -869,20 +1003,7 @@ elif page == "Customer Portal":
                 </div>
             """, unsafe_allow_html=True)
 
-            services_info = [
-                (
-                    "General Inquiry",
-                    "Information and general assistance"
-                ),
-                (
-                    "Payments",
-                    "Billing and payment support"
-                ),
-                (
-                    "Technical Support",
-                    "Help with technical issues"
-                )
-            ]
+            services_info = list(SERVICE_INFO.items())
 
             for item, detail in services_info:
 
@@ -1063,6 +1184,9 @@ elif page == "Admin Panel":
     hero("ADMIN", "See everything. Keep service moving.",
          "Run your counter, watch the analytics and review every record, including the ones flagged as deleted.")
 
+    if db.RECOVERY_NOTE:
+        st.warning(db.RECOVERY_NOTE)
+
     desk, analytics, records, settings_tab = st.tabs(["Counter desk", "Analytics", "All records", "Settings & Outbox"])
 
     with desk:
@@ -1071,33 +1195,33 @@ elif page == "Admin Panel":
         service = c1.selectbox("Service queue", SERVICES)
         counter = c2.selectbox("Your counter", COUNTERS)
 
-        waiting = db.list_tickets(service=service, statuses=["Waiting"])
         mine = [t for t in db.list_tickets(service=service, statuses=["Serving"]) if t["counter"] == counter]
-        _, new_wait = service_wait_now(service)
 
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            metric_card("Waiting", len(waiting), "In this queue", "⏳")
-        with m2:
-            next_label = ("★ " if waiting and waiting[0]["priority"] else "") + (waiting[0]["ticket_code"] if waiting else "—")
-            metric_card("Next ticket", next_label, "Priority first, then first-come", "🎟️")
-        with m3:
-            metric_card("Wait for a new ticket", f"~{new_wait} min", "AI estimate", "🧠")
+        desk_metrics(service)
 
         st.write("")
 
         if mine:
             t = mine[0]
             st.markdown(f'<div class="ticket-code">{html.escape(t["ticket_code"])}</div>', unsafe_allow_html=True)
-            st.write(f"**{t['customer_name']}** at {counter}"
+            st.write(f"**{md_escape(t['customer_name'])}** at {counter}"
                      + (" · ★ Priority" if t["priority"] else "")
-                     + (f" · 📱 {t['phone']}" if t["phone"] else ""))
+                     + (f" · 📱 {md_escape(t['phone'])}" if t["phone"] else ""))
+
+            open_for = minutes_since(t["called_at"])
+
+            if open_for is not None:
+                st.caption(f"Called {open_for} min ago")
+
+                if open_for >= 30:
+                    st.warning("This customer has been at the counter for a long time. "
+                               "If they left, press No-show so the line keeps moving.")
 
             b1, b2, b3 = st.columns(3)
 
             if b1.button("✓ Complete", type="primary", **STRETCH_BTN):
                 if db.complete_ticket(t["ticket_code"]):
-                    st.cache_resource.clear()
+                    load_wait_model.clear()
                     st.rerun()
 
             if b2.button("🔔 Recall", **STRETCH_BTN):
@@ -1128,11 +1252,7 @@ elif page == "Admin Panel":
         if mine:
             st.caption("Finish, recall or close the current customer before calling the next one.")
 
-        if waiting:
-            wdf = pd.DataFrame([dict(r) for r in waiting])
-            wdf["priority"] = wdf["priority"].map({1: "★ Priority", 0: ""})
-            st.dataframe(wdf[["ticket_code", "customer_name", "priority", "phone", "created_at"]],
-                         hide_index=True, **STRETCH_DF)
+        desk_waiting_table(service)
 
     with analytics:
 
@@ -1209,7 +1329,7 @@ elif page == "Admin Panel":
                 st.dataframe(table, **STRETCH_DF)
 
             st.download_button("⬇ Download these tickets (CSV)",
-                               df.drop(columns=["created", "called"]).to_csv(index=False).encode("utf-8"),
+                               csv_safe(df.drop(columns=["created", "called", "secret"], errors="ignore")).to_csv(index=False).encode("utf-8"),
                                "waitwise_tickets.csv", "text/csv")
         else:
             st.info("Analytics will appear after customers start creating tickets.")
@@ -1234,7 +1354,7 @@ elif page == "Admin Panel":
             elif show == "Flagged as deleted only":
                 df = df[df["is_deleted"] == 1]
             st.caption("Deleted rows are never removed. They stay in the database and are only flagged here.")
-            st.dataframe(df.drop(columns=["is_deleted"]), hide_index=True, **STRETCH_DF)
+            st.dataframe(df.drop(columns=["is_deleted", "secret"], errors="ignore"), hide_index=True, **STRETCH_DF)
         else:
             st.info("No records yet.")
 
@@ -1299,10 +1419,13 @@ elif page == "Manager Database":
     hero("MANAGER", "Your database, fully in your hands.",
          "Edit any ticket, add new ones, and flag records as deleted. Nothing is ever erased.")
 
+    if db.RECOVERY_NOTE:
+        st.warning(db.RECOVERY_NOTE)
+
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
 
-    t_edit, t_add, t_fb, t_staff = st.tabs(["Edit tickets", "Add ticket", "Feedback", "Staff accounts"])
+    t_edit, t_add, t_fb, t_staff, t_backup = st.tabs(["Edit tickets", "Add ticket", "Feedback", "Staff accounts", "Backup"])
 
     with t_edit:
 
@@ -1360,7 +1483,7 @@ elif page == "Manager Database":
 
                 if changed and not errors:
                     st.session_state.pop("mgr_editor", None)
-                    st.cache_resource.clear()
+                    load_wait_model.clear()
                     st.session_state["flash"] = f"Saved {changed} change(s)."
                     st.rerun()
                 elif not changed and not errors:
@@ -1398,7 +1521,7 @@ elif page == "Manager Database":
 
         me = st.session_state["user"]["username"]
 
-        if db.defaults_in_use():
+        if defaults_warning():
             st.warning("Some accounts still use the first-run default password. Reset them below.")
 
         st.markdown("**Add a staff account**")
@@ -1410,6 +1533,7 @@ elif page == "Manager Database":
             if st.form_submit_button("Create account", **STRETCH_BTN):
                 try:
                     db.create_user(nu, npw, nr)
+                    defaults_warning.clear()
                     st.success(f"Account “{nu.strip().lower()}” created.")
                 except ValueError as e:
                     st.error(str(e))
@@ -1424,6 +1548,7 @@ elif page == "Manager Database":
             if st.form_submit_button("Reset password", **STRETCH_BTN):
                 try:
                     db.set_password(who, new_pw)
+                    defaults_warning.clear()
                     st.success(f"Password for “{who}” updated.")
                 except ValueError as e:
                     st.error(str(e))
@@ -1448,6 +1573,26 @@ elif page == "Manager Database":
         st.markdown("**Accounts**")
         st.dataframe(pd.DataFrame([dict(u) for u in db.list_users()]).assign(
             is_active=lambda d: d["is_active"].map({1: "Active", 0: "Disabled"})), hide_index=True, **STRETCH_DF)
+
+
+    with t_backup:
+
+        st.markdown("**Database backup**")
+        st.caption("The app saves a copy of the database every hour in the `backups` folder next to app.py "
+                   "(the newest 48 are kept). If the database file is ever damaged, the newest backup is "
+                   "restored automatically when the app starts.")
+
+        saved = sorted(db.BACKUP_DIR.glob("waitwise-*.db")) if db.BACKUP_DIR.exists() else []
+        st.caption(f"{len(saved)} automatic backup(s) on disk" + (f" · newest: {saved[-1].name}" if saved else ""))
+
+        if st.button("Prepare a backup file now"):
+            st.session_state["backup_blob"] = db.backup_bytes()
+
+        if st.session_state.get("backup_blob"):
+            st.download_button("⬇ Download backup", st.session_state["backup_blob"],
+                               f"waitwise-backup-{datetime.now():%Y%m%d-%H%M}.db", "application/octet-stream")
+
+        st.warning("Backups contain customer names and phone numbers. Keep them private.")
 
 
 # =====================================================

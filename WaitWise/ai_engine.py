@@ -1,4 +1,5 @@
 import random
+import re
 from datetime import datetime
 
 import numpy as np
@@ -8,18 +9,9 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import FeatureUnion, Pipeline
 
-
-# ==========================================
-# AVAILABLE SERVICES
-# ==========================================
-
-SERVICES = [
-    "General Inquiry",
-    "Payments",
-    "Technical Support"
-]
+from config import SERVICES, COUNTERS, SERVICE_INFO  # noqa: F401  (re-exported for app.py)
 
 
 # ==========================================
@@ -31,9 +23,14 @@ BASE_MINUTES = {
     "Payments": 7.0,
     "Technical Support": 10.0
 }
+DEFAULT_BASE_MINUTES = 7.0   # for a service added in config.py that has no entry above
 
 MAX_REAL_MINUTES = 120   # a ticket left "Serving" overnight must not poison the model
+MIN_REAL_MINUTES = 0.5   # a few seconds is an accidental click, not a real service
 MIN_REAL_ROWS = 5
+
+REAL_WEIGHT = 3.0        # one real ticket counts as three demo tickets
+DEMO_TARGET = 30         # demo rows per service shrink as real rows arrive (gone at 10 real rows)
 
 
 def _hour_of(called_at):
@@ -48,7 +45,7 @@ def _usable_rows(completed_rows):
     rows = []
     for row in completed_rows:
         service, minutes = row["service"], row["service_minutes"]
-        if service in SERVICES and minutes is not None and 0 < minutes <= MAX_REAL_MINUTES:
+        if service in SERVICES and minutes is not None and MIN_REAL_MINUTES <= minutes <= MAX_REAL_MINUTES:
             try:
                 hour = _hour_of(row["called_at"])
             except (KeyError, IndexError):
@@ -62,32 +59,34 @@ def train_wait_model(completed_rows):
     Train a Random Forest on completed-ticket durations.
 
     Features: which service, and the hour of day it was called (rush hours are slower).
-    - Rows with an unknown service, non-positive or absurd (>2h) duration are ignored.
-    - Any service with fewer than 3 real examples is topped up with synthetic
-      demo data so every service always gets a sensible estimate.
+    - Rows with an unknown service, a duration under 30 s or over 2 h are ignored.
+    - Demo data fills the gaps smoothly: a service with no real tickets gets 30 demo rows,
+      and every real ticket replaces three of them (none left at 10 real tickets).
+      Real tickets also count three times as much as demo rows when the forest is trained.
     - using_real_history is True only when at least 5 usable real rows exist.
     """
     real_rows = _usable_rows(completed_rows)
     rng = random.Random(17)
-    rows = list(real_rows)
+    rows = [(s, h, m, REAL_WEIGHT) for s, h, m in real_rows]
 
     for service in SERVICES:
         have = sum(1 for s, _, _ in real_rows if s == service)
-        if have < 3:
-            for _ in range(35):
-                hour = rng.randint(8, 18)
-                rush = 1.15 if 11 <= hour <= 14 else 1.0
-                base = BASE_MINUTES[service] * rush
-                rows.append((service, hour, max(2.0, rng.gauss(base, base * 0.22))))
+        base_minutes = BASE_MINUTES.get(service, DEFAULT_BASE_MINUTES)
+        for _ in range(max(0, DEMO_TARGET - 3 * have)):
+            hour = rng.randint(8, 18)
+            rush = 1.15 if 11 <= hour <= 14 else 1.0
+            base = base_minutes * rush
+            rows.append((service, hour, max(2.0, rng.gauss(base, base * 0.22)), 1.0))
 
     X = pd.DataFrame({
-        "service_code": [SERVICES.index(s) for s, _, _ in rows],
-        "hour": [h for _, h, _ in rows],
+        "service_code": [SERVICES.index(s) for s, _, _, _ in rows],
+        "hour": [h for _, h, _, _ in rows],
     })
-    y = [m for _, _, m in rows]
+    y = [m for _, _, m, _ in rows]
+    weights = [w for _, _, _, w in rows]
 
-    model = RandomForestRegressor(n_estimators=80, random_state=17)
-    model.fit(X, y)
+    model = RandomForestRegressor(n_estimators=80, min_samples_leaf=2, random_state=17)
+    model.fit(X, y, sample_weight=weights)
 
     return model, len(real_rows) >= MIN_REAL_ROWS
 
@@ -101,7 +100,7 @@ def wait_model_mae(completed_rows):
                       "hour": [h for _, h, _ in real_rows]})
     y = [m for _, _, m in real_rows]
     folds = min(5, len(real_rows) // 3)
-    scores = cross_val_score(RandomForestRegressor(n_estimators=40, random_state=17), X, y,
+    scores = cross_val_score(RandomForestRegressor(n_estimators=40, min_samples_leaf=2, random_state=17), X, y,
                              cv=folds, scoring="neg_mean_absolute_error")
     return float(-scores.mean())
 
@@ -109,6 +108,24 @@ def wait_model_mae(completed_rows):
 # ==========================================
 # PREDICT WAITING TIME
 # ==========================================
+
+def _unit_table(model):
+    """Minutes per person (low, expected, high) for every service x hour, computed once per model.
+
+    Walking all 80 trees for every ticket on every 5-second TV refresh was wasteful: there are
+    only services x 24 hours distinct questions, so we answer them all up front.
+    """
+    table = getattr(model, "_ww_table", None)
+    if table is None:
+        combos = [(s, h) for s in range(len(SERVICES)) for h in range(24)]
+        raw = np.array(combos, dtype=float)
+        per_tree = np.vstack([tree.predict(raw) for tree in model.estimators_])
+        lo, hi = np.percentile(per_tree, [20, 80], axis=0)
+        mid = per_tree.mean(axis=0)
+        table = {c: (float(lo[i]), float(mid[i]), float(hi[i])) for i, c in enumerate(combos)}
+        model._ww_table = table
+    return table
+
 
 def predict_wait_range(model, service, load, counters=1, hour=None):
     """
@@ -120,15 +137,9 @@ def predict_wait_range(model, service, load, counters=1, hour=None):
     """
     if service not in SERVICES:
         service = SERVICES[0]
-    if hour is None:
-        hour = datetime.now().hour
+    hour = (datetime.now().hour if hour is None else int(hour)) % 24
 
-    features = pd.DataFrame({"service_code": [SERVICES.index(service)], "hour": [hour]})
-    mid = float(model.predict(features)[0])
-
-    raw = features.to_numpy(dtype=float)
-    per_tree = [tree.predict(raw)[0] for tree in model.estimators_]
-    lo, hi = (float(v) for v in np.percentile(per_tree, [20, 80]))
+    lo, mid, hi = _unit_table(model)[(SERVICES.index(service), hour)]
 
     scale = max(0.0, float(load)) / max(1, int(counters))
     low, expected, high = (max(1, round(v * scale)) for v in (lo, mid, hi))
@@ -147,62 +158,85 @@ def predict_wait(model, service, people_ahead, counters=1, hour=None):
 INTENTS = {
 
     "greeting": [
-        "hello", "hi", "good morning", "hey there", "good afternoon", "hey"
+        "hello", "hi", "good morning", "hey there", "good afternoon", "hey",
+        "good evening", "hi there", "hiya", "greetings"
     ],
 
     "wait_time": [
         "how long will i wait", "what is my waiting time", "estimate my wait",
-        "how much longer", "when will it be my turn", "how many minutes left"
+        "how much longer", "when will it be my turn", "how many minutes left",
+        "how long is the wait", "what is the estimated waiting time",
+        "how long until i am served", "when will they call me"
     ],
 
     "position": [
         "what is my queue position", "how many people are ahead",
-        "where am i in the queue", "check my ticket position", "am i next"
+        "where am i in the queue", "check my ticket position", "am i next",
+        "what number am i", "how many people are before me",
+        "am i next in line", "how far am i from the front"
     ],
 
     "new_ticket": [
         "how do i get a ticket", "create a queue ticket", "i need a ticket",
-        "how can i join the queue", "join the line", "get in line"
+        "how can i join the queue", "join the line", "get in line",
+        "take a number", "how do i sign up", "where do i register",
+        "i want to register in the queue", "i would like a ticket please",
+        "can i have a ticket", "i want a ticket"
     ],
 
     "services": [
         "what services are available", "which services do you offer",
-        "show me the service options", "what can i get help with"
+        "show me the service options", "what can i get help with",
+        "what departments do you have", "list your services", "what do you offer"
     ],
 
     "cancel": [
         "how do i cancel my ticket", "cancel my queue ticket",
-        "i cannot wait anymore", "remove me from the queue", "leave the queue"
+        "i cannot wait anymore", "remove me from the queue", "leave the queue",
+        "i want to cancel", "delete my ticket", "i do not want to wait any more",
+        "withdraw my ticket"
     ],
 
     "priority": [
         "i am pregnant", "i am elderly", "i have a disability",
         "do you have priority service", "i need priority", "i am in a wheelchair",
-        "senior citizen priority", "i am with a small baby"
+        "senior citizen priority", "i am with a small baby",
+        "i am over 65", "i have a newborn with me", "i am expecting a baby",
+        "my father is old and cannot stand", "my mother is elderly",
+        "i cannot stand for long", "i have trouble walking"
     ],
 
     "no_show": [
         "what if i miss my turn", "i was not here when called",
-        "what happens if i am late", "i missed my number", "my number was called"
+        "what happens if i am late", "i missed my number", "my number was called",
+        "what if i am not here when my number is called",
+        "they called my number but i was not there", "i was late and missed my turn"
     ],
 
     "notifications": [
         "will i get a text message", "can you notify me", "send me an sms",
-        "how will i know it is my turn", "do you send alerts", "can i leave and come back"
+        "how will i know it is my turn", "do you send alerts", "can i leave and come back",
+        "do you send text messages", "can you message me when it is my turn",
+        "do i need to stay here", "can i wait outside",
+        "do i get a notification", "will i be notified", "do you send notifications"
     ],
 
     "open_hours": [
         "are you open", "is the queue open", "can i take a ticket now",
-        "is the queue paused", "are you taking new customers"
+        "is the queue paused", "are you taking new customers",
+        "is the queue closed", "can i still join", "are tickets paused"
     ],
 
     "human": [
         "i want to talk to a person", "speak to a human", "i need a real person",
-        "talk to staff", "i have a complaint"
+        "talk to staff", "i have a complaint",
+        "i want to speak to someone", "give me a real person",
+        "connect me to an agent", "staff please"
     ],
 
     "thanks": [
-        "thank you", "thanks", "that helped", "great thanks", "perfect thank you"
+        "thank you", "thanks", "that helped", "great thanks", "perfect thank you",
+        "thanks a lot", "cheers", "thank you so much", "appreciate it"
     ]
 }
 
@@ -210,6 +244,12 @@ INTENTS = {
 # ==========================================
 # CHATBOT RESPONSES
 # ==========================================
+
+def _service_list():
+    if len(SERVICES) == 1:
+        return SERVICES[0]
+    return ", ".join(SERVICES[:-1]) + ", and " + SERVICES[-1]
+
 
 RESPONSES = {
 
@@ -231,12 +271,12 @@ RESPONSES = {
         "choose a service, and click Create My Ticket.",
 
     "services":
-        "WaitWise currently offers General Inquiry, "
-        "Payments, and Technical Support.",
+        f"WaitWise currently offers {_service_list()}.",
 
     "cancel":
-        "You can cancel your ticket while it is still "
-        "waiting by opening the Customer Portal.",
+        "You can cancel your ticket while it is still waiting: open it from the link you got when you "
+        "created it (or on the device you used) and press Cancel. "
+        "If you lost the link, ask at the service desk.",
 
     "priority":
         "When you create your ticket, tick the priority box if you are a senior, pregnant, "
@@ -268,6 +308,15 @@ RESPONSES = {
 # BUILD AI CHATBOT
 # ==========================================
 
+CONFIDENCE_THRESHOLD = 0.30
+
+
+def _normalize(message):
+    """Lower-case, keep letters/digits/apostrophes only, cap the length."""
+    text = str(message or "").lower()[:300]
+    return " ".join(re.sub(r"[^a-z0-9' ]+", " ", text).split())
+
+
 def build_chatbot():
 
     training_texts = []
@@ -277,17 +326,18 @@ def build_chatbot():
 
         for example in examples:
 
-            training_texts.append(example)
+            training_texts.append(_normalize(example))
             training_labels.append(intent)
 
     chatbot_model = Pipeline([
 
         (
-            "tfidf",
-            TfidfVectorizer(
-                ngram_range=(1, 2),
-                lowercase=True
-            )
+            "features",
+            # words understand meaning, character pieces forgive typos ("wating tme")
+            FeatureUnion([
+                ("words", TfidfVectorizer(ngram_range=(1, 2), lowercase=True)),
+                ("chars", TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), lowercase=True)),
+            ])
         ),
 
         (
@@ -312,11 +362,29 @@ def build_chatbot():
 # GENERATE CHATBOT RESPONSE
 # ==========================================
 
+def _status_line(ticket):
+    code, status = ticket["ticket_code"], ticket["status"]
+    if status == "Serving":
+        return f"Ticket {code} is being called now. Please go to {ticket['counter'] or 'the service desk'}."
+    if status == "Completed":
+        return f"Ticket {code} is complete. Thank you!"
+    if status == "No-show":
+        return f"Ticket {code} was closed because it was called and nobody came. You can take a new one."
+    if status == "Cancelled":
+        return f"Ticket {code} was cancelled."
+    return f"Your ticket {code} is currently {status}."
+
+
 def chatbot_reply(model, message, ticket=None, info=None):
     """
     info (optional) is live data about the customer's ticket, e.g.
-    {"position": 3, "wait_low": 8, "wait_high": 14} so the bot can give real numbers.
+    {"ahead": 3, "wait_low": 8, "wait_high": 14} so the bot can give real numbers.
     """
+
+    message = _normalize(message)
+
+    if not message:
+        return "Type a question to start chatting."
 
     intent = model.predict([message])[0]
 
@@ -324,7 +392,7 @@ def chatbot_reply(model, message, ticket=None, info=None):
 
     confidence = max(probabilities)
 
-    if confidence < 0.30:
+    if confidence < CONFIDENCE_THRESHOLD:
 
         return (
             "I'm not sure I understood. "
@@ -336,16 +404,17 @@ def chatbot_reply(model, message, ticket=None, info=None):
 
     if intent == "wait_time" and ticket:
 
-        if ticket["status"] == "Waiting" and "wait_low" in info:
+        if ticket["status"] == "Waiting" and "wait_low" in info and "ahead" in info:
+            low, high = info["wait_low"], info["wait_high"]
+            span = f"{low}-{high} minutes" if high > low else f"{low} {'minute' if low == 1 else 'minutes'}"
+            if info["ahead"] == 0:
+                return f"Ticket {ticket['ticket_code']}: you're next! Expect to be called in about {span}."
             return (
-                f"Ticket {ticket['ticket_code']}: about {info['wait_low']}-{info['wait_high']} minutes "
-                f"to go, with {info['ahead']} people ahead of you."
+                f"Ticket {ticket['ticket_code']}: about {span} "
+                f"to go, with {info['ahead']} {'person' if info['ahead'] == 1 else 'people'} ahead of you."
             )
 
-        return (
-            f"Your ticket {ticket['ticket_code']} "
-            f"is currently {ticket['status']}."
-        )
+        return _status_line(ticket)
 
     if intent == "position" and ticket:
 
@@ -356,10 +425,7 @@ def chatbot_reply(model, message, ticket=None, info=None):
                 f"{'person' if info['ahead'] == 1 else 'people'} ahead of it."
             )
 
-        return (
-            f"Your ticket is {ticket['ticket_code']} "
-            f"and its current status is {ticket['status']}."
-        )
+        return _status_line(ticket)
 
     return RESPONSES.get(
         intent,

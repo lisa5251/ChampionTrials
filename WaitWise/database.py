@@ -1,17 +1,29 @@
 """SQLite storage for WaitWise tickets, feedback, settings and notifications."""
 import hashlib
 import hmac
+import logging
 import os
 import re
+import secrets
+import shutil
 import sqlite3
+import tempfile
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import notifier
+from config import SERVICES
 
-DB_PATH = Path(__file__).parent / "waitwise.db"
+log = logging.getLogger("waitwise.db")
+
+# WAITWISE_DB lets you point the app at another file (handy for tests or a second branch).
+DB_PATH = Path(os.getenv("WAITWISE_DB") or Path(__file__).parent / "waitwise.db")
+BACKUP_DIR = DB_PATH.parent / "backups"
+BACKUP_KEEP = 48          # one backup per hour at most, newest 48 kept
 
 ROLES = ["admin", "manager"]
 DEFAULT_LOGINS = {"admin": "1234", "manager": "5678"}  # first-run only; change them in Manager > Staff accounts
@@ -27,6 +39,9 @@ DEFAULT_SETTINGS = {
 
 # Waiting tickets are ordered: priority first, then first-come-first-served.
 ORDER = "priority DESC, id ASC"
+
+# Set at start-up if the database file had to be replaced (the app shows it to staff).
+RECOVERY_NOTE = None
 
 
 class QueueClosed(ValueError):
@@ -53,34 +68,122 @@ def _now():
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _ensure_valid_db():
-    """If waitwise.db exists but is not a real SQLite file (corrupt, partial copy,
-    edited in a text editor...), move it aside as waitwise.db.corrupt-<time> and
-    let a fresh database be created instead of crashing."""
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
-        return
+# ---------- start-up, recovery and backups ----------
+
+def _is_valid_db(path):
     try:
-        check = sqlite3.connect(DB_PATH, timeout=10)
+        check = sqlite3.connect(path, timeout=10)
         try:
-            ok = check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            return check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         finally:
             check.close()
     except sqlite3.DatabaseError:
-        ok = False
-    if not ok:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        DB_PATH.rename(DB_PATH.with_name(f"{DB_PATH.name}.corrupt-{stamp}"))
-        for extra in ("-journal", "-wal", "-shm"):
-            leftover = DB_PATH.with_name(DB_PATH.name + extra)
-            if leftover.exists():
-                leftover.unlink()
+        return False
 
 
-def init_db():
+def _restore_latest_backup():
+    """Copy the newest VALID backup over DB_PATH. Returns its file name or None."""
+    for candidate in sorted(BACKUP_DIR.glob("waitwise-*.db"), reverse=True):
+        if _is_valid_db(candidate):
+            shutil.copy2(candidate, DB_PATH)
+            return candidate.name
+    return None
+
+
+def _ensure_valid_db():
+    """If waitwise.db exists but is not a real SQLite file (corrupt, partial copy, a text
+    file saved under that name...), move it aside as waitwise.db.corrupt-<time>, then restore the
+    newest automatic backup if there is one (otherwise a fresh database is created)."""
+    global RECOVERY_NOTE
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return
+    if _is_valid_db(DB_PATH):
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    aside = DB_PATH.with_name(f"{DB_PATH.name}.corrupt-{stamp}")
+    n = 1
+    while aside.exists():                     # never overwrite an earlier damaged copy
+        n += 1
+        aside = DB_PATH.with_name(f"{DB_PATH.name}.corrupt-{stamp}-{n}")
+    DB_PATH.rename(aside)
+    for extra in ("-journal", "-wal", "-shm"):
+        leftover = DB_PATH.with_name(DB_PATH.name + extra)
+        if leftover.exists():
+            leftover.unlink()
+    restored = _restore_latest_backup()
+    if restored:
+        RECOVERY_NOTE = (f"The database file was damaged. It was moved to {aside.name} and the automatic "
+                         f"backup {restored} was restored. Tickets created after that backup may be missing.")
+    else:
+        RECOVERY_NOTE = (f"The database file was damaged and there was no backup. It was moved to {aside.name} "
+                         "and a fresh database was created.")
+    log.warning(RECOVERY_NOTE)
+
+
+def _copy_db(dest):
+    """Consistent copy of the live database (safe while the app is running, WAL included)."""
+    src = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        dst = sqlite3.connect(dest)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+_backup_lock = threading.Lock()
+_last_backup_key = None
+
+
+def maybe_backup(force=False):
+    """Save a copy of the database in ./backups, at most once per hour. Never raises."""
+    global _last_backup_key
+    key = datetime.now().strftime("%Y%m%d-%H")
+    if not force and key == _last_backup_key:
+        return None
+    with _backup_lock:
+        try:
+            if not DB_PATH.exists():
+                return None
+            BACKUP_DIR.mkdir(exist_ok=True)
+            target = BACKUP_DIR / f"waitwise-{key}.db"
+            if force or not target.exists():
+                tmp = target.with_suffix(".tmp")
+                _copy_db(tmp)
+                os.replace(tmp, target)
+            _last_backup_key = key
+            for old in sorted(BACKUP_DIR.glob("waitwise-*.db"))[:-BACKUP_KEEP]:
+                old.unlink(missing_ok=True)
+            return target
+        except Exception:
+            log.exception("Automatic backup failed")
+            return None
+
+
+def backup_bytes():
+    """The whole database as bytes, for a 'download backup' button."""
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "waitwise-backup.db"
+        _copy_db(target)
+        return target.read_bytes()
+
+
+_initialized = False
+
+
+def init_db(force=False):
+    """Create/upgrade the database. Cheap to call on every Streamlit rerun (runs once per process)."""
+    global _initialized
+    if _initialized and not force:
+        return
     _ensure_valid_db()
     _create_tables()
     _migrate()
     _seed_users()
+    _initialized = True
+    maybe_backup()
 
 
 def _create_tables():
@@ -144,19 +247,26 @@ def _migrate():
         for name, ddl in [("counter", "TEXT"), ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
                           ("deleted_at", "TEXT"), ("deleted_by", "TEXT"), ("updated_at", "TEXT"),
                           ("priority", "INTEGER NOT NULL DEFAULT 0"), ("phone", "TEXT"),
-                          ("notified_next", "INTEGER NOT NULL DEFAULT 0")]:
+                          ("notified_next", "INTEGER NOT NULL DEFAULT 0"),
+                          ("secret", "TEXT")]:   # secret = per-ticket key: only its owner may cancel / review
             if name not in have:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {name} {ddl}")
+        for row in conn.execute("SELECT id FROM tickets WHERE secret IS NULL OR secret=''").fetchall():
+            conn.execute("UPDATE tickets SET secret=? WHERE id=?", (secrets.token_hex(4), row["id"]))
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_queue ON tickets(service, status, is_deleted)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_code ON notifications(ticket_code)")
 
 
 # ---------- settings ----------
 
+def _settings(conn):
+    stored = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+    return {**DEFAULT_SETTINGS, **stored}
+
+
 def get_settings():
     with connect() as conn:
-        stored = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
-    return {**DEFAULT_SETTINGS, **stored}
+        return _settings(conn)
 
 
 def set_setting(key, value):
@@ -167,20 +277,45 @@ def set_setting(key, value):
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
 
+def _int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------- input cleaning ----------
+
+def _clean_name(name):
+    """Drop control characters and squeeze whitespace."""
+    return " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(name or "")).split())
+
+
+def _clean_phone(phone):
+    phone = "" if phone is None else str(phone).strip()
+    if not phone:
+        return None
+    digits = sum(c.isdigit() for c in phone)
+    if len(phone) > 20 or not all(c.isdigit() or c in "+- ()" for c in phone) or not 6 <= digits <= 15:
+        raise ValueError("Enter a valid phone number (6-15 digits; +, spaces and dashes are fine).")
+    return phone
+
+
 # ---------- notifications ----------
 
 def _record(conn, outbox, code, phone, message):
+    channel = "sms" if phone and notifier.sms_enabled() else "screen"
     conn.execute(
         "INSERT INTO notifications(ticket_code, channel, phone, message, created_at) VALUES(?,?,?,?,?)",
-        (code, "sms" if phone else "screen", phone, message, _now()))
+        (code, channel, phone, message, _now()))
     outbox.append((phone, message))
 
 
 def _flush(outbox):
-    """Send real SMS only AFTER the database transaction has been committed."""
+    """Send real SMS only AFTER the database transaction has been committed (and in the background)."""
     for phone, message in outbox:
         if phone:
-            notifier.send(phone, message)
+            notifier.send_async(phone, message)
 
 
 def _promote_next(conn, outbox, service):
@@ -202,35 +337,38 @@ def recent_notifications(limit=100):
 def ticket_notifications(code, limit=5):
     with connect() as conn:
         return conn.execute("SELECT * FROM notifications WHERE ticket_code=? ORDER BY id DESC LIMIT ?",
-                            (code.upper().strip(), limit)).fetchall()
+                            ((code or "").upper().strip(), limit)).fetchall()
 
 
 # ---------- tickets ----------
 
 def create_ticket(name, service, priority=False, phone=None, enforce=True):
-    name = (name or "").strip()
+    name = _clean_name(name)
     if not name:
         raise ValueError("Customer name cannot be empty.")
     if len(name) > 60:
         raise ValueError("Name is too long (60 characters max).")
-    phone = (phone or "").strip() or None
-    if phone and (len(phone) > 20 or not all(c.isdigit() or c in "+- ()" for c in phone)):
-        raise ValueError("Enter a valid phone number (digits, +, spaces and dashes only).")
-
-    if enforce:
-        cfg = get_settings()
-        if cfg["queue_open"] != "1":
-            raise QueueClosed("The queue is temporarily paused. Please ask at the service desk.")
-        cap = int(cfg["max_waiting"] or 0)
-        if cap and len(list_tickets(service=service, statuses=["Waiting"])) >= cap:
-            raise QueueClosed(f"The {service} queue is full right now. Please try again shortly.")
+    if service not in SERVICES:
+        raise ValueError("Please choose one of the available services.")
+    phone = _clean_phone(phone)
 
     outbox = []
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")  # the capacity check and the insert can't be split by another customer
+        if enforce:
+            cfg = _settings(conn)
+            if cfg["queue_open"] != "1":
+                raise QueueClosed("The queue is temporarily paused. Please ask at the service desk.")
+            cap = _int(cfg["max_waiting"])
+            waiting = conn.execute("SELECT COUNT(*) FROM tickets WHERE service=? AND status='Waiting' "
+                                   "AND is_deleted=0", (service,)).fetchone()[0]
+            if cap and waiting >= cap:
+                raise QueueClosed(f"The {service} queue is full right now. Please try again shortly.")
         cur = conn.execute(
-            "INSERT INTO tickets(ticket_code, customer_name, service, status, created_at, priority, phone) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (f"NEW-{uuid.uuid4().hex}", name, service, "Waiting", _now(), 1 if priority else 0, phone)
+            "INSERT INTO tickets(ticket_code, customer_name, service, status, created_at, priority, phone, secret) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (f"NEW-{uuid.uuid4().hex}", name, service, "Waiting", _now(), 1 if priority else 0, phone,
+             secrets.token_hex(4))
         )
         ticket_id = cur.lastrowid
         code = f"WW-{ticket_id:04d}"
@@ -241,12 +379,18 @@ def create_ticket(name, service, priority=False, phone=None, enforce=True):
     return code
 
 
-def find_active_ticket(name, service):
-    """Used to warn about accidental double sign-ups by the same person."""
+def find_active_ticket(name, service, phone=None):
+    """Used to warn about accidental double sign-ups (same name, or same phone number)."""
+    phone = (phone or "").strip() or None
+    query = ("SELECT * FROM tickets WHERE service=? AND status IN ('Waiting','Serving') AND is_deleted=0 "
+             "AND (lower(customer_name)=lower(?)")
+    params = [service, _clean_name(name)]
+    if phone:
+        query += " OR phone=?"
+        params.append(phone)
+    query += ") LIMIT 1"
     with connect() as conn:
-        return conn.execute(
-            "SELECT * FROM tickets WHERE lower(customer_name)=lower(?) AND service=? "
-            "AND status IN ('Waiting','Serving') AND is_deleted=0 LIMIT 1", ((name or "").strip(), service)).fetchone()
+        return conn.execute(query, params).fetchone()
 
 
 def get_ticket(code):
@@ -333,8 +477,12 @@ def complete_ticket(code):
         row = conn.execute("SELECT * FROM tickets WHERE ticket_code=?", ((code or "").upper().strip(),)).fetchone()
         if not row or row["status"] != "Serving":
             return False
-        start = datetime.fromisoformat(row["called_at"]) if row["called_at"] else now
-        minutes = max(0.1, (now - start).total_seconds() / 60)
+        # No (or unreadable) call time -> no duration. A made-up 0.1 min would teach the AI wrong waits.
+        try:
+            start = datetime.fromisoformat(row["called_at"]) if row["called_at"] else None
+        except ValueError:
+            start = None
+        minutes = max(0.1, (now - start).total_seconds() / 60) if start else None
         conn.execute(
             "UPDATE tickets SET status='Completed', completed_at=?, service_minutes=? WHERE ticket_code=?",
             (now.isoformat(timespec="seconds"), minutes, row["ticket_code"])
@@ -365,6 +513,9 @@ def mark_no_show(code):
 
 def transfer_ticket(code, new_service):
     """Move a waiting/serving customer to another service queue (keeps priority)."""
+    if new_service not in SERVICES:
+        return False
+    outbox = []
     with connect() as conn:
         row = conn.execute("SELECT * FROM tickets WHERE ticket_code=? AND status IN ('Waiting','Serving')",
                            ((code or "").upper().strip(),)).fetchone()
@@ -373,8 +524,6 @@ def transfer_ticket(code, new_service):
         conn.execute(
             "UPDATE tickets SET service=?, status='Waiting', called_at=NULL, counter=NULL, notified_next=0, "
             "updated_at=? WHERE id=?", (new_service, _now(), row["id"]))
-    outbox = []
-    with connect() as conn:
         _promote_next(conn, outbox, row["service"])
         _promote_next(conn, outbox, new_service)
     _flush(outbox)
@@ -382,15 +531,14 @@ def transfer_ticket(code, new_service):
 
 
 def cancel_ticket(code):
-    with connect() as conn:
-        row = conn.execute("SELECT service FROM tickets WHERE ticket_code=? AND status='Waiting' AND is_deleted=0",
-                           ((code or "").upper().strip(),)).fetchone()
-        if not row:
-            return False
-        conn.execute("UPDATE tickets SET status='Cancelled', updated_at=? WHERE ticket_code=?",
-                     (_now(), (code or "").upper().strip()))
+    code = (code or "").upper().strip()
     outbox = []
     with connect() as conn:
+        row = conn.execute("SELECT service FROM tickets WHERE ticket_code=? AND status='Waiting' AND is_deleted=0",
+                           (code,)).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE tickets SET status='Cancelled', updated_at=? WHERE ticket_code=?", (_now(), code))
         _promote_next(conn, outbox, row["service"])
     _flush(outbox)
     return True
@@ -404,12 +552,16 @@ def has_feedback(code):
 
 
 def add_feedback(code, rating, comment):
-    """One review per ticket. Returns False if this ticket already left feedback."""
+    """One review per ticket, and only for a completed ticket. Returns False otherwise."""
     code = (code or "").upper().strip()
-    if has_feedback(code):
-        return False
     rating = min(5, max(1, int(rating)))
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ticket = conn.execute("SELECT status FROM tickets WHERE ticket_code=? AND is_deleted=0", (code,)).fetchone()
+        if not ticket or ticket["status"] != "Completed":
+            return False
+        if conn.execute("SELECT 1 FROM feedback WHERE ticket_code=?", (code,)).fetchone():
+            return False
         conn.execute(
             "INSERT INTO feedback(ticket_code,rating,comment,created_at) VALUES(?,?,?,?)",
             (code, rating, (comment or "").strip()[:1000], _now())
@@ -462,12 +614,22 @@ def update_ticket(ticket_id, fields):
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
-    if "customer_name" in fields and not str(fields["customer_name"] or "").strip():
-        raise ValueError("Customer name cannot be empty.")
+    if "customer_name" in fields:
+        fields["customer_name"] = _clean_name(fields["customer_name"])
+        if not fields["customer_name"]:
+            raise ValueError("Customer name cannot be empty.")
+        if len(fields["customer_name"]) > 60:
+            raise ValueError("Name is too long (60 characters max).")
+    if "service" in fields and fields["service"] not in SERVICES:
+        raise ValueError(f"Service must be one of {SERVICES}.")
     if "status" in fields and fields["status"] not in STATUSES:
         raise ValueError(f"Status must be one of {STATUSES}.")
+    if "phone" in fields:
+        fields["phone"] = _clean_phone(fields["phone"])
     if fields.get("service_minutes") is not None:
         fields["service_minutes"] = float(fields["service_minutes"])
+        if fields["service_minutes"] < 0:
+            raise ValueError("Service minutes cannot be negative.")
     if "priority" in fields:
         fields["priority"] = 1 if fields["priority"] else 0
     fields["updated_at"] = _now()
@@ -477,13 +639,14 @@ def update_ticket(ticket_id, fields):
 
 
 def add_ticket(name, service, status="Waiting", counter=None, priority=False):
+    if status not in STATUSES:
+        raise ValueError(f"Status must be one of {STATUSES}.")
     code = create_ticket(name, service, priority=priority, enforce=False)
     if status != "Waiting" or counter:
         with connect() as conn:
             row = conn.execute("SELECT id FROM tickets WHERE ticket_code=?", (code,)).fetchone()
         update_ticket(row["id"], {"status": status, "counter": counter})
     return code
-
 
 
 # ---------- staff accounts (customers never need one) ----------
@@ -528,6 +691,52 @@ def verify_user(username, password):
         return None
     ok = hmac.compare_digest(_hash(password or "", row["salt"]), row["password_hash"])
     return row["role"] if ok else None
+
+
+# Sign-in throttle. Kept in the server process (not in the browser session), so opening a new
+# tab or clearing cookies does not reset it. Each lock-out is twice as long as the one before.
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECONDS = 60
+_login_state = {}
+_login_lock = threading.Lock()
+
+
+def login_locked_for(username):
+    """Seconds this username is still locked out (0 = free to try)."""
+    key = (username or "").strip().lower()
+    with _login_lock:
+        state = _login_state.get(key)
+        if state and state["until"] > time.time():
+            return int(state["until"] - time.time()) + 1
+    return 0
+
+
+def attempt_login(username, password):
+    """Returns (role, locked_seconds). role is None when the login failed or the name is locked."""
+    key = (username or "").strip().lower()
+    wait = login_locked_for(key)
+    if wait:
+        return None, wait
+    role = verify_user(username, password)
+    with _login_lock:
+        if role:
+            _login_state.pop(key, None)
+            return role, 0
+        now = time.time()
+        state = _login_state.setdefault(key, {"fails": 0, "lockouts": 0, "until": 0.0, "last": now})
+        if now - state["last"] > 3600:        # a quiet hour forgives earlier mistakes
+            state["fails"], state["lockouts"] = 0, 0
+        state["last"] = now
+        state["fails"] += 1
+        if state["fails"] >= LOGIN_MAX_FAILS:
+            state["fails"] = 0
+            state["lockouts"] += 1
+            state["until"] = now + min(900, LOGIN_LOCK_SECONDS * 2 ** (state["lockouts"] - 1))
+            wait = int(state["until"] - now) + 1
+        if len(_login_state) > 1000:          # don't let random usernames grow memory forever
+            for k in [k for k, v in _login_state.items() if now - v["last"] > 3600]:
+                del _login_state[k]
+    return None, wait
 
 
 def user_role(username):
